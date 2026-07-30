@@ -1,0 +1,28 @@
+{
+  "name": "button",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A green button on a pole. The Kei demo game.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run server/main.ts",
+    "build": "bun build src/main.ts --outdir public/build --target browser --sourcemap=linked",
+    "build:site": "bun run build.ts",
+    "preview": "bun run build.ts && wrangler dev",
+    "deploy": "bun run build.ts && wrangler deploy",
+    "check": "bun run build.ts && wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "link-sdk": "bun link kei-transaction"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^9.19.0",
+    "kei-transaction": "link:kei-transaction"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+public/build/
+dist/
+.wrangler/
+*.tsbuildinfo
+bun.lockb
+.DS_Store
+.env
+.env.*
+!.env.example

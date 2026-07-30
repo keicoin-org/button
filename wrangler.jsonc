@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "keicoin-example-button",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-01",
+  // bananojs reaches for a couple of Node built-ins for key derivation.
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The client, built by `bun run build` into dist/examples/button/ so the
+  // asset paths match the URLs they are served at.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+
+  // The chain. One object, one name, so everybody shares one ledger.
+  "durable_objects": {
+    "bindings": [{ "name": "ARENA", "class_name": "Arena" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Arena"] }],
+
+  // More specific than keicoin-site's route, so this Worker owns the demo and
+  // the site owns everything else (SPEC §10.4).
+  "routes": [{ "pattern": "keicoin.org/examples/button*", "zone_name": "keicoin.org" }],
+
+  "observability": { "enabled": true }
+}

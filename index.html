@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Button</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0e1417;
+        overflow: hidden;
+      }
+      /* The only HTML in the game. The balance is a screen in the world, not an
+         overlay on top of it (SPEC §8) — this is a canvas and a hint. */
+      #game {
+        display: block;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+        outline: none;
+      }
+      #hint {
+        position: fixed;
+        left: 50%;
+        bottom: 18px;
+        transform: translateX(-50%);
+        margin: 0;
+        color: #6f8478;
+        font: 500 13px/1.4 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+        letter-spacing: 0.04em;
+        pointer-events: none;
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="game" touch-action="none"></canvas>
+    <p id="hint">click the button or press space · drag to look · click the shop board to buy</p>
+    <!-- Relative, because this page is served at / in development and at
+         /examples/button/ on keicoin.org. -->
+    <script type="module" src="./build/main.js"></script>
+  </body>
+</html>
