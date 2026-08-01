@@ -109,6 +109,12 @@ describe('pressing', () => {
 })
 
 describe('the shop', () => {
+  test('the Golden Button Cap is a supply-one native item', async () => {
+    const { game, player } = await table()
+    const cap = game.catalogue().upgrades.find((upgrade) => upgrade.sku === 'cap')!
+    expect((await (await player.token(cap.asset)).info()).maxSupply).toBe('1')
+  }, 20_000)
+
   test('an upgrade is bought with a transfer and delivered as an item', async () => {
     const { game, player } = await table()
     const catalogue = game.catalogue()

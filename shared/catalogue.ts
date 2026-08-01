@@ -77,7 +77,8 @@ export const UPGRADES: readonly Upgrade[] = [
     name: 'Golden Button Cap',
     description: 'Purely decorative, and it doubles everything.',
     price: 6_000,
-    supply: 10_000,
+    // M4's unique native item: the NPC can sell exactly one on the network.
+    supply: 1,
     multiplier: 2,
   },
 ]

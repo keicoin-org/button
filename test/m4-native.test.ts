@@ -36,11 +36,12 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
     expect(await coins.balance()).toBe(25)
 
     // Earn the remainder, pay the NPC, and ask the native holders index who owns it.
-    const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
-    await player.claims.add(await game.bank(player.address, glove.price))
-    const order = await game.order(player.address, glove.sku)
+    const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
+    expect((await player.token(cap.asset)).info()).resolves.toMatchObject({ maxSupply: '1' })
+    await player.claims.add(await game.bank(player.address, cap.price))
+    const order = await game.order(player.address, cap.sku)
     await coins.transfer(order.to, order.price)
-    await until(async () => (await player.items.owner(glove.asset)) === player.address, 'native item delivery')
-    expect(await player.items.owner(glove.asset)).toBe(player.address)
+    await until(async () => (await player.items.owner(cap.asset)) === player.address, 'native item delivery')
+    expect(await player.items.owner(cap.asset)).toBe(player.address)
   }, 60_000)
 })
