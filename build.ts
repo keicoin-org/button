@@ -30,6 +30,9 @@ if (!bundle.success) {
 
 await mkdir(dirname(join(out, 'index.html')), { recursive: true })
 await copyFile(join(root, 'index.html'), join(out, 'index.html'))
+// The page asks for ./favicon.ico, which at /examples/button/ is this one and
+// not the site's — same coin, served by whichever Worker owns the path.
+await copyFile(join(root, 'public/favicon.ico'), join(out, 'favicon.ico'))
 
 const size = (await stat(join(out, 'build', 'main.js'))).size
 console.log(`\n  dist/examples/button — ${(size / 1024 / 1024).toFixed(2)} MB\n`)

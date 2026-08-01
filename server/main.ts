@@ -65,6 +65,9 @@ const server = Bun.serve({
   routes: {
     '/': () => new Response(Bun.file(`${root}index.html`), { headers: { 'content-type': 'text/html' } }),
 
+    '/favicon.ico': () =>
+      new Response(Bun.file(`${root}public/favicon.ico`), { headers: { 'content-type': 'image/x-icon' } }),
+
     '/build/*': (request) => {
       // Only what the bundler wrote, and only by name — no path walking.
       const name = new URL(request.url).pathname.slice('/build/'.length)
