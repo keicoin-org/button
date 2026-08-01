@@ -109,6 +109,12 @@ describe('pressing', () => {
 })
 
 describe('the shop', () => {
+  test('the Golden Button Cap is a supply-one native item', async () => {
+    const { game, player } = await table()
+    const cap = game.catalogue().upgrades.find((upgrade) => upgrade.sku === 'cap')!
+    expect((await (await player.token(cap.asset)).info()).maxSupply).toBe('1')
+  }, 20_000)
+
   test('an upgrade is bought with a transfer and delivered as an item', async () => {
     const { game, player } = await table()
     const catalogue = game.catalogue()
@@ -175,6 +181,26 @@ describe('the shop', () => {
   }, 20_000)
 })
 
+describe('mob loot', () => {
+  test('a defeated mob drops a claim the player writes on their own chain', async () => {
+    const { game, player } = await table()
+    const coins = await player.token(game.catalogue().coin.asset)
+    const bundle = await game.loot(player.address, 'slime-1')
+    expect(bundle.root).toMatch(/^[0-9A-F]{64}$/)
+    await player.claims.add(bundle)
+    expect(await coins.balance()).toBe(25)
+  }, 20_000)
+
+  test('a retry returns the same entitlement instead of duplicating the drop', async () => {
+    const { game, player } = await table()
+    const [first, retry] = await Promise.all([
+      game.loot(player.address, 'slime-2'),
+      game.loot(player.address, 'slime-2'),
+    ])
+    expect(retry).toEqual(first)
+  }, 20_000)
+})
+
 describe('the exchange desk', () => {
   test('paying Kei mints coins at the posted rate', async () => {
     const { game, player } = await table()
@@ -182,7 +208,7 @@ describe('the exchange desk', () => {
     const coins = await player.token(catalogue.coin.asset)
 
     await player.faucet(1)
-    await player.pay({ to: game.address, amount: 0.25, memo: 'top-up' })
+    await player.pay({ to: game.address, amount: 0.25 })
     await until(async () => (await coins.balance()) > 0, 'the coins to be minted')
 
     expect(await coins.balance()).toBe(250)

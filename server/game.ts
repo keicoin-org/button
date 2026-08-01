@@ -39,6 +39,8 @@ export interface Game {
   catalogue(): CataloguePayload
   /** Pay for presses. Returns the proof the player claims with (SPEC §5.5). */
   bank(address: string, presses: number): Promise<ClaimBundle>
+  /** Defeat a world mob once; its coin drop is a rooted claim, not server state. */
+  loot(address: string, mob: string): Promise<ClaimBundle>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
   order(address: string, sku: string): Promise<{ to: string; price: number; asset: string }>
   close(): void
@@ -96,6 +98,7 @@ export async function startGame(options: GameOptions): Promise<Game> {
   const drops = new DropBatch(coins, options.flushMs ?? 1_500)
   const lastBank = new Map<string, number>()
   const rateCap = options.pressRateCap ?? DEFAULT_PRESS_RATE_CAP
+  const lootClaims = new Map<string, Promise<ClaimBundle>>()
 
   return {
     address: kei.address,
@@ -125,6 +128,20 @@ export async function startGame(options: GameOptions): Promise<Game> {
 
       const { perPress } = payoutFor(await ownedBy(kei, address, items))
       return drops.add(address, counted * perPress)
+    },
+
+    loot(address, mob) {
+      if (!/^slime-[1-3]$/.test(mob)) throw new GameError('That mob does not exist.')
+      const key = `${address}:${mob}`
+      const existing = lootClaims.get(key)
+      if (existing) return existing
+      // Store the promise before waiting so double clicks cannot publish two leaves.
+      const claim = drops.add(address, 25).catch((error) => {
+        lootClaims.delete(key)
+        throw error
+      })
+      lootClaims.set(key, claim)
+      return claim
     },
 
     order(address, sku) {

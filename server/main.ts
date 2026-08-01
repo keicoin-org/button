@@ -102,6 +102,17 @@ const server = Bun.serve({
         }
       },
     },
+
+    '/game/loot': {
+      async POST(request) {
+        try {
+          const { address, mob } = await read<{ address: string; mob: string }>(request)
+          return json({ bundle: await game.loot(address, mob) })
+        } catch (error) {
+          return failed(error)
+        }
+      },
+    },
   },
 })
 
