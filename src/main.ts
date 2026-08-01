@@ -24,6 +24,10 @@ world.onBuy((target) => {
   else void economy.buy(target)
 })
 
+world.onMob((mob) => {
+  void economy.loot(mob)
+})
+
 economy.on((state) => world.update(state))
 world.update(economy.state)
 

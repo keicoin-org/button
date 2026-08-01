@@ -45,6 +45,7 @@ type Ctx = CanvasRenderingContext2D
 export interface World {
   onPress(handler: () => void): void
   onBuy(handler: (target: string) => void): void
+  onMob(handler: (mob: string) => void): void
   update(state: EconomyState): void
   pop(text: string): void
   dispose(): void
@@ -180,7 +181,17 @@ export function createWorld(canvas: HTMLCanvasElement): World {
 
   const pressHandlers: Array<() => void> = []
   const buyHandlers: Array<(target: string) => void> = []
+  const mobHandlers: Array<(mob: string) => void> = []
   const pressable = new Set<AbstractMesh>([cap, housing, pole, plinth])
+  const mobs = new Map<AbstractMesh, string>()
+  for (let index = 1; index <= 3; index++) {
+    const slime = MeshBuilder.CreateSphere(`slime-${index}`, { diameter: 1.05, segments: 12 }, scene)
+    slime.scaling.y = 0.65
+    slime.position.set(3.2 + index * 1.35, 0.35, -1.2 + (index % 2) * 2.1)
+    slime.material = solid(scene, `slimeMaterial-${index}`, '#6bbf59')
+    shadows.addShadowCaster(slime)
+    mobs.set(slime, `slime-${index}`)
+  }
   let rows: Row[] = []
 
   let pressedFor = 0
@@ -212,6 +223,12 @@ export function createWorld(canvas: HTMLCanvasElement): World {
 
     if (pressable.has(pick.pickedMesh)) {
       doPress()
+      return
+    }
+    const mob = mobs.get(pick.pickedMesh)
+    if (mob) {
+      pick.pickedMesh.setEnabled(false)
+      for (const handler of mobHandlers) handler(mob)
       return
     }
     if (pick.pickedMesh === shop.mesh) {
@@ -280,6 +297,9 @@ export function createWorld(canvas: HTMLCanvasElement): World {
     },
     onBuy(handler) {
       buyHandlers.push(handler)
+    },
+    onMob(handler) {
+      mobHandlers.push(handler)
     },
     update(state) {
       pending = state

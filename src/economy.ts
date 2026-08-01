@@ -50,6 +50,7 @@ export interface Economy {
   readonly state: EconomyState
   press(times?: number): void
   buy(sku: string): Promise<void>
+  loot(mob: string): Promise<void>
   topUp(kei: number): Promise<void>
   on(listener: (state: EconomyState) => void): void
   close(): void
@@ -231,11 +232,28 @@ export async function connect(): Promise<Economy> {
       }
     },
 
+    async loot(mob) {
+      try {
+        const response = await fetch(at('/game/loot'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ address: kei.address, mob }),
+        })
+        const body = (await response.json()) as { bundle?: Parameters<typeof kei.claims.add>[0]; error?: string }
+        if (body.error || !body.bundle) throw new Error(body.error ?? 'The mob dropped no claim proof.')
+        await kei.claims.add(body.bundle)
+        state.message = 'Claimed 25 coins from the mob drop.'
+        changed()
+      } catch (error) {
+        say(error)
+      }
+    },
+
     async topUp(amount) {
       try {
         state.message = null
         if ((await kei.balance()) < amount && catalogue.network !== 'mainnet') await kei.faucet()
-        await kei.pay({ to: catalogue.issuer, amount, memo: 'top-up' })
+        await kei.pay({ to: catalogue.issuer, amount })
         state.message = `Paid ${amount} Kei. Coins on the way.`
         changed()
       } catch (error) {
@@ -270,6 +288,9 @@ function offline(
     async buy() {
       /* nothing to buy without a shop */
     },
+    async loot() {
+		/* no chain, so there is no claimable drop */
+	},
     async topUp() {
       /* nothing to pay without a chain */
     },
