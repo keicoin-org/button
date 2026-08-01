@@ -37,7 +37,7 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
 
     // Earn the remainder, pay the NPC, and ask the native holders index who owns it.
     const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
-    expect((await player.token(cap.asset)).info()).resolves.toMatchObject({ maxSupply: '1' })
+    expect(await (await player.token(cap.asset)).info()).toMatchObject({ maxSupply: '1' })
     await player.claims.add(await game.bank(player.address, cap.price))
     const order = await game.order(player.address, cap.sku)
     await coins.transfer(order.to, order.price)
