@@ -21,6 +21,9 @@ const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
 const RED = '#f87171'
 
+const KEI_COIN = new Image()
+KEI_COIN.src = './kei-coin-64.png'
+
 export const BALANCE_SIZE = { width: 640, height: 360 }
 export const SHOP_SIZE = { width: 640, height: 520 }
 
@@ -52,9 +55,14 @@ export function drawBalance(ctx: Ctx, state: EconomyState): void {
   ctx.font = `600 26px ${FONT}`
   ctx.fillText('COINS', 34, 62)
 
+  // Optimistic, like the amber unbanked counter below: a press's coins are
+  // shown the instant it happens rather than only once the bank/claim round
+  // trip confirms them. `pendingCoins` is drained as real confirmations land
+  // (economy.ts's bank()), so this never double-counts a press once it is
+  // actually banked.
   ctx.fillStyle = state.online ? GREEN : RED
   ctx.font = `700 108px ${MONO}`
-  ctx.fillText(number(state.coins), 30, 168)
+  ctx.fillText(number(state.coins + state.pendingCoins), 30, 168)
 
   ctx.font = `500 28px ${FONT}`
   ctx.fillStyle = INK
@@ -72,7 +80,12 @@ export function drawBalance(ctx: Ctx, state: EconomyState): void {
   ctx.fillStyle = DIM
   ctx.font = `500 24px ${MONO}`
   const kei = state.online ? `${state.kei.toFixed(3)} kei` : 'offline'
-  ctx.fillText(state.banking ? 'banking…' : state.claiming > 0 ? 'claiming…' : kei, width - 34, 262)
+  const keiStatus = state.banking ? 'banking…' : state.claiming > 0 ? 'claiming…' : kei
+  if (state.online && KEI_COIN.complete && KEI_COIN.naturalWidth > 0) {
+    const labelWidth = ctx.measureText(keiStatus).width
+    ctx.drawImage(KEI_COIN, width - 34 - labelWidth - 39, 232, 32, 32)
+  }
+  ctx.fillText(keiStatus, width - 34, 262)
 
   // The message line is the only place errors are shown, and they are shown as
   // the SDK wrote them (SPEC §6.1).

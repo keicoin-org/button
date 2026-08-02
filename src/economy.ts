@@ -36,6 +36,15 @@ export interface EconomyState {
   coins: number
   /** Presses this browser has made and not yet banked. */
   unbanked: number
+  /**
+   * Coins this browser has been optimistically credited for a press that have
+   * not yet landed in `coins` — added to it for display so the headline
+   * number moves the instant a press happens, the same way `unbanked` already
+   * does, instead of lagging behind the bank/claim round trip. Drained by
+   * `apply` as real confirmations arrive, never by `bank` starting, so the
+   * number does not dip while a batch is in flight.
+   */
+  pendingCoins: number
   banking: boolean
   perPress: number
   pressesPerSecond: number
@@ -78,6 +87,7 @@ export async function connect(): Promise<Economy> {
     kei: 0,
     coins: 0,
     unbanked: 0,
+    pendingCoins: 0,
     banking: false,
     perPress: 1,
     pressesPerSecond: 0,
@@ -166,6 +176,12 @@ export async function connect(): Promise<Economy> {
     state.unbanked = 0
     state.banking = true
     changed()
+    // What this batch is worth, at today's payout — same figure the server
+    // computes in server/game.ts's bank(). Captured now rather than read back
+    // off `state.perPress` later, so a mid-flight upgrade purchase cannot
+    // change how much of `pendingCoins` this particular batch is allowed to
+    // drain.
+    const amount = presses * state.perPress
     try {
       const response = await fetch(at('/game/bank'), {
         method: 'POST',
@@ -179,9 +195,14 @@ export async function connect(): Promise<Economy> {
       // the claim that collects it is written by this wallet, from this account,
       // in parallel with every other player claiming off the same root (§5.5).
       await kei.claims.add(body.bundle)
+      // Real coins are landing (or already have — `apply` may beat this line
+      // to `state.coins`), so this batch's share of the optimistic estimate
+      // is no longer needed to cover the gap.
+      state.pendingCoins = Math.max(0, state.pendingCoins - amount)
       state.message = null
     } catch (error) {
       // Nothing was minted, so the presses are still owed. Put them back.
+      // `pendingCoins` is untouched — it was never drained for this batch.
       state.unbanked += presses
       say(error)
     } finally {
@@ -192,6 +213,7 @@ export async function connect(): Promise<Economy> {
 
   const press = (times = 1): void => {
     state.unbanked += times
+    state.pendingCoins += times * state.perPress
     if (state.unbanked >= BANK_AFTER_PRESSES) void bank()
     else timer ??= setTimeout(() => void bank(), BANK_AFTER_MS)
     changed()
