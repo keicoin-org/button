@@ -7,7 +7,6 @@ anybody having to invent a reason.
 
 ```sh
 bun install
-bun run link-sdk     # once — links ../kei-transaction (SPEC §10.5)
 bun run dev          # http://localhost:7777
 ```
 

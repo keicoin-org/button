@@ -5,7 +5,7 @@
       "name": "button",
       "dependencies": {
         "@babylonjs/core": "^9.19.0",
-        "kei-transaction": "link:kei-transaction",
+        "kei-transaction": "^0.2.0",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",
@@ -16,6 +16,8 @@
   },
   "packages": {
     "@babylonjs/core": ["@babylonjs/core@9.19.0", "", {}, "sha512-8bQfSnXnFVEUolPBl5Y3S1WDmQKpPKfguOQvGdCxjTIHlLku8Crc0DdvlFbmqeGpS/bQ3NzwtApB84GScm9v8w=="],
+
+    "@bananocoin/bananojs": ["@bananocoin/bananojs@2.10.10", "", { "dependencies": { "package": "^1.0.1" } }, "sha512-ST6BvZAP2S5Ppwb2o0VfOsIvSKWN/MM9oUgVhHd+7ONoFxvkO2TY+7nHWxuGDksrV/vbbuq055InIK2adNRV9w=="],
 
     "@cloudflare/kv-asset-handler": ["@cloudflare/kv-asset-handler@0.5.0", "", {}, "sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg=="],
 
@@ -147,6 +149,16 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.9", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.0.3", "@jridgewell/sourcemap-codec": "^1.4.10" } }, "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ=="],
 
+    "@keicoin/claims": ["@keicoin/claims@0.2.0", "", { "dependencies": { "@keicoin/core": "^0.2.0" } }, "sha512-WI5QLE06BEVOOcr1z5YIqxAjgw8wTve4vXL2ayaVw+dr2qcyigEY4wQNVSxxdhItcNVb8wRu8BdLDfGW8DN6hg=="],
+
+    "@keicoin/core": ["@keicoin/core@0.2.0", "", { "dependencies": { "@bananocoin/bananojs": "^2.10.10" } }, "sha512-GsD8kb5vBkDVXhh1jiLIO6b5Y5nseTrwj7/U5dS2z6Es7irEyfRhhrHsGXbS3ueI0ng7+18lrsA+/6kIrAt/4w=="],
+
+    "@keicoin/tokens": ["@keicoin/tokens@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0" } }, "sha512-BeV9lU5r7XH0fN+ACGy/aMAJtt75MBIxxQ7GOsUwv165RsRwoXL+BCsy3uAdX0gx3HkwBYlOSojM8bcxONdqaw=="],
+
+    "@keicoin/wallet": ["@keicoin/wallet@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0", "@keicoin/tokens": "^0.2.0" } }, "sha512-luXb0I+LXHpqBrDbd99AEMXF/CetDuqXS6xRxTcYUpchx7PuUAHLRL8c/0ZUJSF6bGLZm5kuAj+h0HXfy/3Dzw=="],
+
+    "@keicoin/work": ["@keicoin/work@0.2.0", "", { "dependencies": { "@keicoin/core": "^0.2.0" }, "bin": { "kei-work-server": "dist/cli.js" } }, "sha512-omMQo/jh5y4ydsnnuONvdocwwQLzc+QdFNzmV8fq0cgfufp0UHJ55kE3bS8+joF78gfiGM/LxYKPJbz+ivgY8A=="],
+
     "@poppinss/colors": ["@poppinss/colors@4.1.6", "", { "dependencies": { "kleur": "^4.1.5" } }, "sha512-H9xkIdFswbS8n1d6vmRd8+c10t2Qe+rZITbbDHHkQixH5+2x1FDGmi/0K+WgWiqQFKPSlIYB7jlH6Kpfn6Fleg=="],
 
     "@poppinss/dumper": ["@poppinss/dumper@0.6.5", "", { "dependencies": { "@poppinss/colors": "^4.1.5", "@sindresorhus/is": "^7.0.2", "supports-color": "^10.0.0" } }, "sha512-NBdYIb90J7LfOI32dOewKI1r7wnkiH6m920puQ3qHUeZkxNkQiFnXVWoE6YtFSv6QOiPPf7ys6i+HWWecDz7sw=="],
@@ -175,11 +187,13 @@
 
     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
 
-    "kei-transaction": ["kei-transaction@link:kei-transaction", {}],
+    "kei-transaction": ["kei-transaction@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0", "@keicoin/tokens": "^0.2.0", "@keicoin/wallet": "^0.2.0", "@keicoin/work": "^0.2.0" } }, "sha512-JXkTBeTkC7MyDbAyly/++5Z3q2uGZq9ixaMOkDBMpOgclWfTsuoZY8QRJHhQIecSa2+aztAgVJrlcAYlKJDOdw=="],
 
     "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
 
     "miniflare": ["miniflare@5.20260730.0-alpha", "", { "dependencies": { "@cspotcode/source-map-support": "0.8.1", "sharp": "0.35.2", "undici": "7.28.0", "workerd": "1.20260730.1", "ws": "8.21.0", "youch": "4.1.0-beta.10" } }, "sha512-8/dspSXDshP6nSkCpjKO7BYc2qZoYSXm7iM+QxY7qJyJpAB3onnQSaiu0cvKJlfuMGwULl55hG69FJCcCMXU1Q=="],
+
+    "package": ["package@1.0.1", "", {}, "sha512-g6xZR6CO7okjie83sIRJodgGvaXqymfE5GLhN8N2TmZGShmHc/V23hO/vWbdnuy3D81As3pfovw72gGi42l9qA=="],
 
     "path-to-regexp": ["path-to-regexp@6.3.0", "", {}, "sha512-Yhpw4T9C6hPpgPeA28us07OJeqZ5EzQTkbfwuhsUg0c237RomFoETJgmp2sa3F/41gfLE6G5cqcYwznmeEeOlQ=="],
 
