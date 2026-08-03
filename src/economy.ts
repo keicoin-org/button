@@ -34,6 +34,7 @@ import {
   reconcileConfirmed,
   type CoinLedger,
 } from './ledger.js'
+import { serialClaims } from './claim-queue.js'
 
 export interface ShopRow extends Upgrade {
   asset: string
@@ -193,6 +194,11 @@ export async function connect(): Promise<Economy> {
   kei.wallet.on('change', apply)
   kei.on('error', say)
 
+  // Banking and mob drops both enter the SDK's one shared held-bundle map.
+  // Serialize at that common boundary so no two claimAll sweeps can read and
+  // submit the same proof concurrently.
+  const addClaim = serialClaims<ClaimBundle>((bundle) => kei.claims.add(bundle))
+
   // ------------------------------------------------------------------ banking
 
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -257,7 +263,7 @@ export async function connect(): Promise<Economy> {
       // Nothing is drained here: `reconcileConfirmed` takes these coins out of
       // `settling` when the chain's own figure rises, which is the same event
       // seen from the side that can be trusted.
-      await kei.claims.add(bundle)
+      await addClaim(bundle)
     } catch (error) {
       // They leave the tally rather than going back to `unbanked` — the game
       // already paid for those presses, and pressing them again is not what
@@ -381,7 +387,7 @@ export async function connect(): Promise<Economy> {
         state.message = `Claiming ${Math.floor(amount)} coins from the mob drop.`
         changed()
         try {
-          await kei.claims.add(body.bundle)
+          await addClaim(body.bundle)
         } catch (error) {
           state.coins = claimFailed(state.coins, amount)
           throw error

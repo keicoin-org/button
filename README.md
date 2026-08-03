@@ -56,8 +56,9 @@ therefore shows three deliberately different figures:
 Affordability and the client-side gate before `/game/order` read only
 `confirmed`; the server then checks the chain itself and remains authoritative.
 Moving a reward between stages keeps COUNTED stable, while a server rate cap or
-failed claim rolls it back to the supported amount. Banks are serialized through
-claim completion so two SDK claim sweeps cannot race the same proof.
+failed claim rolls it back to the supported amount. All claim writes — press
+banks and mob drops alike — share one serialized queue through completion, so
+two SDK sweeps cannot race the same proof.
 
 CLEARING is session bookkeeping, not chain state. Reloading loses unbanked
 presses and in-memory claim bundles, and unrelated inbound transfers can make the
