@@ -13,7 +13,7 @@
  * standalone wallet, or in a game this one has never heard of.
  */
 
-import { Kei, type PlayerToken, type WalletSummary } from 'kei-transaction'
+import { Kei, type ClaimBundle, type PlayerToken, type WalletSummary } from 'kei-transaction'
 
 import {
   payoutFor,
@@ -37,12 +37,11 @@ export interface EconomyState {
   /** Presses this browser has made and not yet banked. */
   unbanked: number
   /**
-   * Coins this browser has been optimistically credited for a press that have
-   * not yet landed in `coins` — added to it for display so the headline
-   * number moves the instant a press happens, the same way `unbanked` already
-   * does, instead of lagging behind the bank/claim round trip. Drained by
-   * `apply` as real confirmations arrive, never by `bank` starting, so the
-   * number does not dip while a batch is in flight.
+   * Coins this browser has pressed for and the chain has not paid out yet —
+   * presses still unbanked, plus whatever is in flight. Shown beside the
+   * balance and never added to it: `coins` is what the chain says, and this is
+   * what is still owed. Drained by real confirmations rather than by `bank`
+   * starting, so it does not blink to zero while a batch is in flight.
    */
   pendingCoins: number
   banking: boolean
@@ -167,6 +166,10 @@ export async function connect(): Promise<Economy> {
 
   let timer: ReturnType<typeof setTimeout> | undefined
 
+  /** A bundle's amount is raw units; every other figure in this file is display units. */
+  const paid = (bundle: ClaimBundle): number =>
+    Number(bundle.amount) / 10 ** catalogue.coin.decimals
+
   const bank = async (): Promise<void> => {
     if (timer) clearTimeout(timer)
     timer = undefined
@@ -176,29 +179,24 @@ export async function connect(): Promise<Economy> {
     state.unbanked = 0
     state.banking = true
     changed()
-    // What this batch is worth, at today's payout — same figure the server
-    // computes in server/game.ts's bank(). Captured now rather than read back
-    // off `state.perPress` later, so a mid-flight upgrade purchase cannot
-    // change how much of `pendingCoins` this particular batch is allowed to
-    // drain.
-    const amount = presses * state.perPress
     try {
       const response = await fetch(at('/game/bank'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ address: kei.address, presses }),
       })
-      const body = (await response.json()) as { bundle?: Parameters<typeof kei.claims.add>[0]; error?: string }
+      const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
       if (body.error || !body.bundle) throw new Error(body.error ?? 'The game server sent no proof back.')
 
       // From here the game is not involved. The bundle is an entitlement, and
       // the claim that collects it is written by this wallet, from this account,
       // in parallel with every other player claiming off the same root (§5.5).
       await kei.claims.add(body.bundle)
-      // Real coins are landing (or already have — `apply` may beat this line
-      // to `state.coins`), so this batch's share of the optimistic estimate
-      // is no longer needed to cover the gap.
-      state.pendingCoins = Math.max(0, state.pendingCoins - amount)
+      // Drained by what the chain actually paid, not by what the presses were
+      // hoped to be worth: the server caps a bank that arrived too fast to be
+      // a hand (server/game.ts's bank()), and the bundle carries the capped
+      // figure. Those coins have landed, so they are no longer owed.
+      state.pendingCoins = Math.max(0, state.pendingCoins - paid(body.bundle))
       state.message = null
     } catch (error) {
       // Nothing was minted, so the presses are still owed. Put them back.
@@ -261,7 +259,7 @@ export async function connect(): Promise<Economy> {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ address: kei.address, mob }),
         })
-        const body = (await response.json()) as { bundle?: Parameters<typeof kei.claims.add>[0]; error?: string }
+        const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
         if (body.error || !body.bundle) throw new Error(body.error ?? 'The mob dropped no claim proof.')
         await kei.claims.add(body.bundle)
         state.message = 'Claimed 25 coins from the mob drop.'
@@ -305,6 +303,9 @@ function offline(
     state,
     press(times = 1) {
       state.unbanked += times
+      // Owed by a game that is not there, which is the honest reading of it:
+      // the message line already says nothing is being banked.
+      state.pendingCoins += times * state.perPress
       changed()
     },
     async buy() {

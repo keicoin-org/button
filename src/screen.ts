@@ -55,14 +55,13 @@ export function drawBalance(ctx: Ctx, state: EconomyState): void {
   ctx.font = `600 26px ${FONT}`
   ctx.fillText('COINS', 34, 62)
 
-  // Optimistic, like the amber unbanked counter below: a press's coins are
-  // shown the instant it happens rather than only once the bank/claim round
-  // trip confirms them. `pendingCoins` is drained as real confirmations land
-  // (economy.ts's bank()), so this never double-counts a press once it is
-  // actually banked.
+  // The chain's figure, and nothing added to it. What a press has earned and
+  // not been paid for yet is the amber number on the right, which moves on the
+  // press itself — so the screen still answers instantly without this one
+  // being a guess, and without it disagreeing with the shop board.
   ctx.fillStyle = state.online ? GREEN : RED
   ctx.font = `700 108px ${MONO}`
-  ctx.fillText(number(state.coins + state.pendingCoins), 30, 168)
+  ctx.fillText(number(state.coins), 30, 168)
 
   ctx.font = `500 28px ${FONT}`
   ctx.fillStyle = INK
@@ -72,10 +71,17 @@ export function drawBalance(ctx: Ctx, state: EconomyState): void {
     ctx.fillText(`${state.pressesPerSecond}/s automatic`, 34, 262)
   }
 
+  // Counted in coins rather than presses, because coins are what the player is
+  // waiting for, and because this is the number the green one is not allowed
+  // to include until the chain has paid it.
   ctx.textAlign = 'right'
-  ctx.fillStyle = state.unbanked > 0 ? AMBER : DIM
+  ctx.fillStyle = state.pendingCoins > 0 ? AMBER : DIM
   ctx.font = `600 30px ${MONO}`
-  ctx.fillText(state.unbanked > 0 ? `${number(state.unbanked)} unbanked` : 'all banked', width - 34, 222)
+  ctx.fillText(
+    state.pendingCoins > 0 ? `+${number(state.pendingCoins)} pending` : 'all banked',
+    width - 34,
+    222,
+  )
 
   ctx.fillStyle = DIM
   ctx.font = `500 24px ${MONO}`
