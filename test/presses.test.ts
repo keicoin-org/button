@@ -321,6 +321,32 @@ describe('banking what the room saw', () => {
     expect(alice.sent).toHaveLength(2)
   })
 
+  test('a claim that cannot be delivered is still paid for', async () => {
+    const { room: button, presses, calls } = room()
+    const alice = stub('a')
+    button.onJoin(asClient(alice), { address: ALICE })
+    button.press(alice, 6)
+
+    // Same session, but the socket dies while the answer is going out — after
+    // the issuer has already handed over a claim.
+    const dropped: ResponseClient = {
+      sessionId: alice.sessionId,
+      send() {
+        throw new Error('socket closed')
+      },
+    }
+    await expect(button.bank(dropped, { id: 'gone', presses: 6 })).rejects.toThrow('socket closed')
+
+    // The presses paid for that claim and stay spent: rolling them back here
+    // would let the same six buy a second payout.
+    expect(calls).toEqual([{ address: ALICE, presses: 6 }])
+    expect(presses.pending(ALICE)).toBe(0)
+
+    const replay = await button.bank(alice, { id: 'again', presses: 6 })
+    expect(replay).toEqual({ ok: false, id: 'again', error: 'The server saw no presses to bank.' })
+    expect(calls).toHaveLength(1)
+  })
+
   test('a failure leaves the other player untouched', async () => {
     const failing: BankPresses = async (address) => {
       throw new Error(`no payout for ${address}`)

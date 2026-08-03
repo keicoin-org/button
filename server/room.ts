@@ -149,16 +149,22 @@ export function createButtonRoom(dependencies: ButtonRoomDependencies) {
       const observed = presses.consume(address, requested)
       if (observed <= 0) return this.answer(client, { ok: false, id, error: 'The server saw no presses to bank.' })
 
+      let claim: ClaimBundle
       try {
-        const claim = await bankPresses(address, observed)
-        return this.answer(client, { ok: true, id, presses: observed, claim })
+        claim = await bankPresses(address, observed)
       } catch {
-        // Exactly what was taken, so a failed payout costs the player nothing and
-        // earns them nothing. The issuer's reason is not forwarded: it is written
-        // for a log, and this message goes to whoever asked.
+        // Only the payout is guarded, and it restores exactly what was taken, so
+        // a failed payout costs the player nothing and earns them nothing. The
+        // issuer's reason is not forwarded: it is written for a log, and this
+        // message goes to whoever asked.
         presses.restore(address, observed)
         return this.answer(client, { ok: false, id, error: 'Banking failed. Your presses are still yours.' })
       }
+
+      // Past the rollback on purpose. The claim exists now, so a socket that
+      // cannot be written to loses the answer and not the presses that paid for
+      // it — restoring here would sell them a second time.
+      return this.answer(client, { ok: true, id, presses: observed, claim })
     }
 
     override onLeave(client: Client): void {
