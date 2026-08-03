@@ -35,6 +35,8 @@ import {
   type CoinLedger,
 } from './ledger.js'
 import { serialClaims } from './claim-queue.js'
+import { joinArena, type ArenaSession } from './multiplayer.js'
+import { ownershipSigner, playerSeed } from './ownership.js'
 
 export interface ShopRow extends Upgrade {
   asset: string
@@ -142,7 +144,11 @@ export async function connect(): Promise<Economy> {
     state.exchange = catalogue.exchange
     state.network = catalogue.network
 
+    // Button provisions the seed rather than letting the SDK do it, so the same
+    // key can answer the arena's ownership challenge (`src/ownership.ts` says
+    // what that costs). Same store, same key, same wallet as before.
     kei = await Kei.start({
+      seed: playerSeed(catalogue.network),
       node: `${location.origin}${at('/rpc')}`,
       network: catalogue.network as 'mock' | 'testnet',
     })
@@ -199,6 +205,51 @@ export async function connect(): Promise<Economy> {
   // submit the same proof concurrently.
   const addClaim = serialClaims<ClaimBundle>((bundle) => kei.claims.add(bundle))
 
+  // ------------------------------------------------------------------- arena
+
+  /**
+   * The multiplayer session, when this deployment has a room.
+   *
+   * There is no third state. Either the catalogue advertised a room and every
+   * press and bank goes through it, or it did not and the single-player HTTP
+   * route is open. What this must never do is answer a room being unreachable
+   * by posting to `/game/bank` instead — that route is closed while the room is
+   * up, and a client that tried it would be asking to be paid for presses
+   * nobody saw.
+   */
+  const multiplayer = catalogue.arena
+  let arena: ArenaSession | null = null
+
+  const connectArena = async (): Promise<ArenaSession | null> => {
+    if (!multiplayer) return null
+    if (arena) return arena
+    const signer = await ownershipSigner(playerSeed(catalogue.network))
+    arena = await joinArena({
+      url: multiplayer.url,
+      room: multiplayer.room,
+      signer,
+      onClosed(reason) {
+        // Whatever this session had proved is gone with the socket. Presses
+        // made from here are counted by this browser and observed by nobody,
+        // which is what the next bank will find out and say.
+        arena = null
+        state.message = reason
+        changed()
+      },
+    })
+    return arena
+  }
+
+  if (multiplayer) {
+    try {
+      await connectArena()
+    } catch (error) {
+      // Playable, and honest about it: the button works, the presses stack up,
+      // and nothing banks until the room is reachable again.
+      say(error)
+    }
+  }
+
   // ------------------------------------------------------------------ banking
 
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -213,6 +264,38 @@ export async function connect(): Promise<Economy> {
   /** A bundle's amount is raw units; every other figure in this file is display units. */
   const paid = (bundle: ClaimBundle): number =>
     Number(bundle.amount) / 10 ** catalogue.coin.decimals
+
+  /**
+   * Single-player: the game is told a number and takes the client's word for it,
+   * bounded by its own rate cap. Only reachable where no room was advertised.
+   */
+  const bankOverHttp = async (presses: number): Promise<ClaimBundle> => {
+    const response = await fetch(at('/game/bank'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ address: kei.address, presses }),
+    })
+    const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
+    if (body.error || !body.bundle) throw new Error(body.error ?? 'The game server sent no proof back.')
+    return body.bundle
+  }
+
+  /**
+   * Multiplayer: spend presses the room watched arrive, on a session that
+   * proved this wallet.
+   *
+   * A dropped socket is reconnected here rather than at the moment it dropped,
+   * because that is when it matters and because a reconnect loop against a
+   * server that is down is worse than a player who is told once. Presses the
+   * room already observed survive the disconnect and are still spendable; ones
+   * made while it was down were seen by nobody, and the smaller number that
+   * comes back is the honest answer to that.
+   */
+  const bankInArena = async (presses: number): Promise<ClaimBundle> => {
+    const session = arena ?? (await connectArena())
+    if (!session) throw new Error('The button room is not reachable, so nothing can be banked yet.')
+    return (await session.bank(presses)).claim
+  }
 
   /**
    * Ask the game to price a batch, take the proof, write the claim.
@@ -230,14 +313,7 @@ export async function connect(): Promise<Economy> {
 
     let bundle: ClaimBundle
     try {
-      const response = await fetch(at('/game/bank'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ address: kei.address, presses }),
-      })
-      const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
-      if (body.error || !body.bundle) throw new Error(body.error ?? 'The game server sent no proof back.')
-      bundle = body.bundle
+      bundle = multiplayer ? await bankInArena(presses) : await bankOverHttp(presses)
     } catch (error) {
       // Nothing was signed, so the presses are still owed. They go back to
       // where they were and the headline does not move.
@@ -317,6 +393,9 @@ export async function connect(): Promise<Economy> {
     // count of presses rather than as a balance.
     state.unbankedPresses += times
     state.coins = pressed(state.coins, times * state.perPress)
+    // Told to the room as it happens, not totalled up at banking time — the
+    // point of an observed press is that the server saw it arrive.
+    arena?.press(times)
     if (state.unbankedPresses >= BANK_AFTER_PRESSES) void bank()
     else timer ??= setTimeout(() => void bank(), BANK_AFTER_MS)
     changed()
@@ -444,6 +523,7 @@ export async function connect(): Promise<Economy> {
     close() {
       clearInterval(auto)
       if (timer) clearTimeout(timer)
+      arena?.close()
       kei.close()
     },
   }

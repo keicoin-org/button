@@ -28,8 +28,8 @@ worth, and what things cost.
 
 | | |
 |---|---|
-| **Press** | Click the button, or hit space. Presses accumulate unbanked. |
-| **Bank** | Every 20 presses (or 3 seconds) the client asks the server to pay for them. The server adds you to the next batch. |
+| **Press** | Click the button, or hit space. Presses accumulate unbanked, and in multiplayer each one is also a message the room counts. |
+| **Bank** | Every 20 presses (or 3 seconds) the client asks the server to pay for them, and is paid for what the server saw. The server adds you to the next batch. |
 | **Claim** | The batch becomes **one** `commit` block; you get a proof and your own wallet writes the claim. |
 | **Buy** | Click a row on the shop board. You transfer coins; the shopkeeper mints you the item and burns the coins. |
 | **Exchange** | Optional. Pay Kei, get coins at the posted rate. Turn it off and the game is unchanged. |
@@ -85,12 +85,53 @@ carries no memo, so the shop takes the order first and matches the arrival to it
 — and delivers nothing until the chain says the coins landed. The order is not
 the purchase.
 
+### Why a multiplayer address needs a signature
+
+A Kei address is public, so writing one in Colyseus join options proves nothing.
+The room sends a one-use, 10-second, domain-separated challenge binding the
+address to its room, socket session, opaque player id, and random nonce. Only a
+valid Kei signature moves that session into the map allowed to press or bank;
+pending joins cannot touch the shared address-keyed tally.
+
+The wallet never signs the digest it is handed — it re-derives one from the
+parsed challenge and refuses if the two disagree, because a client that signs
+server-supplied bytes is a signing oracle and those bytes could be a send. The
+ownership preimage starts with its own ASCII domain, which no Kei block hash
+does, so an ownership signature is not a block signature and a block signature
+is not a session. See the [M8 session-auth protocol and threat
+model](docs/m8-session-auth.md).
+
+### Multiplayer, and the one path it leaves open
+
+```sh
+bun run dev                       # game on :7777, observed-press room on :7778
+BUTTON_MULTIPLAYER=off bun run dev  # single-player, the old HTTP path
+```
+
+With the room up, presses are messages the server watched arrive and banking
+spends only what it saw. **`/game/bank` is closed while the room is running**,
+because leaving both open would not be a fallback but a bypass — an attacker
+would post to the easier one and the whole boundary would be decoration. The
+catalogue tells the client which single path exists, and `bankingPolicy` in
+`server/arena.ts` is the one expression both halves read so they cannot drift.
+
+The deployed demo at `keicoin.org/examples/button` is single-player: a Durable
+Object is not a Colyseus server, so there is no room there and `/game/bank` is
+the open path.
+
 ## Where things are
 
 ```
 shared/catalogue.ts   what a press is worth and what upgrades cost — used by both halves
+shared/session-auth.ts what an ownership signature covers. One definition, both halves.
 server/game.ts        the issuer: token, items, the batcher, the shop. The whole backend.
 server/main.ts        one Bun server: the mock node at /rpc, the game at /game/*, the client at /
+server/auth.ts        the server half: opaque challenge tokens, and verification
+server/room.ts        authenticated Colyseus press and bank boundary
+server/presses.ts     observed presses shared by authenticated wallet address
+server/arena.ts       the listener the room lives behind, and which way banking is open
+src/ownership.ts      the wallet's narrow answer to a challenge. The only key in game code.
+src/multiplayer.ts    the browser's end of the room: prove, press, bank
 src/economy.ts        every line of Kei in the client
 src/ledger.ts         where a coin is — counted, clearing, or confirmed. Pure arithmetic.
 src/world.ts          Babylon: the button, the screen, the shopkeeper
@@ -118,9 +159,19 @@ it says on the screen that nothing is being banked.
 
 ## Honest about what this is not
 
-- **The client counts its own presses.** In single-player nothing else can see
-  them. There is a rate ceiling so the hole is worth a few coins rather than the
-  supply, and that is all it is. M8 adds Colyseus, and presses become observed.
+- **Multiplayer bounds whose presses, not how many.** With the room up, only a
+  wallet that proved its key can spend that wallet's tally — but a scripted
+  client can still send more press messages than a hand could make, and what
+  bounds the payout is the issuer's rate ceiling, exactly as in single-player.
+  A per-address observation ceiling is the next control and is not built.
+- **Single-player still takes the client's word for its own count**, with that
+  same rate ceiling over it. That is the deployed demo, and it is the honest
+  reading of `BUTTON_MULTIPLAYER=off`.
+- **The player's key is in game code, not only in the SDK.** Answering a room
+  challenge needs a signature and the SDK exposes no signer, so `src/ownership.ts`
+  provisions the seed and holds the derived key behind a signer that will not
+  sign anything but a challenge for its own address. The proper fix is a
+  `signOwnershipChallenge` in the SDK; see the threat model.
 - **The chain is a mock.** M2 is the real node; M3 points `/rpc` at it, and
   nothing above that line changes.
 - **The issuer seed is generated per run** unless `KEI_GAME_SEED` is set. A new

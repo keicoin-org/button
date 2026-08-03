@@ -111,6 +111,22 @@ export function payoutFor(owned: Readonly<Record<string, number>>): Payout {
   return { perPress: perPress * multiplier, pressesPerSecond }
 }
 
+/**
+ * Where the observed-press room lives, when there is one.
+ *
+ * Absent means single-player: this deployment has no room, `/game/bank` takes
+ * the client's own count, and the README says so. Present means the opposite
+ * and means it strictly — the room is the only way to bank, because the HTTP
+ * route is closed while it is up. A client cannot read this and choose the
+ * easier path; there is only ever one path open.
+ */
+export interface ArenaPayload {
+  /** Absolute, because the room is its own listener and not a path on this one. */
+  url: string
+  /** The registered room type to join. */
+  room: string
+}
+
 /** What the server tells the client about this game. Item ids are derived on-chain. */
 export interface CataloguePayload {
   issuer: string
@@ -119,4 +135,6 @@ export interface CataloguePayload {
   /** Off when the game is running with payments disabled (SPEC §8). */
   exchange: { open: boolean; coinsPerKei: number; minimum: number }
   upgrades: Array<Upgrade & { asset: string }>
+  /** Absent wherever multiplayer is not running — the Worker, most of all. */
+  arena?: ArenaPayload
 }

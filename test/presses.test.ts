@@ -1,14 +1,28 @@
 import { describe, expect, test } from 'bun:test'
 import type { Client } from '@colyseus/core'
-import { addressFromPublicKey, type ClaimBundle } from 'kei-transaction'
+import { keyPairFromSeed, signHash, type KeyPair } from '@keicoin/core'
+import type { ClaimBundle } from 'kei-transaction'
 
+import {
+  AUTH_CHALLENGE,
+  AUTH_RESULT,
+  type OwnershipChallengeMessage,
+} from '../server/auth.js'
 import { MAX_PRESSES_PER_MESSAGE, PressRegistry } from '../server/presses.js'
-import { BANK, createButtonRoom, type BankPresses, type BankResult, type ResponseClient } from '../server/room.js'
+import {
+  BANK,
+  createButtonRoom,
+  type BankPresses,
+  type BankResult,
+  type ButtonRoom,
+  type ResponseClient,
+} from '../server/room.js'
 
-// Real addresses, derived rather than typed, because the server checks the
-// checksum now: a hand-written `kei_alice` is exactly the thing it rejects.
-const ALICE = addressFromPublicKey('1'.repeat(64))
-const BOB = addressFromPublicKey('2'.repeat(64))
+// Real wallet keys: room joins now prove control, not merely checksum shape.
+const ALICE_KEYS = await keyPairFromSeed('1'.repeat(64), 0)
+const BOB_KEYS = await keyPairFromSeed('2'.repeat(64), 0)
+const ALICE = ALICE_KEYS.address
+const BOB = BOB_KEYS.address
 
 /** Alice's address with its last character bumped: right shape, wrong checksum. */
 const FORGED = ALICE.slice(0, -1) + (ALICE.endsWith('a') ? 'b' : 'a')
@@ -111,17 +125,25 @@ describe('the observed-press registry', () => {
  */
 function stub(sessionId: string) {
   const sent: Array<{ type: string; message: unknown }> = []
+  const left: Array<{ code?: number; data?: string }> = []
   return {
     sessionId,
     send(type: string, message?: unknown) {
       sent.push({ type, message })
     },
     sent,
+    leave(code?: number, data?: string) {
+      left.push({ ...(code === undefined ? {} : { code }), ...(data === undefined ? {} : { data }) })
+    },
+    left,
     /** The last thing the room said to this client. */
     last(): BankResult {
-      const latest = sent.at(-1)
+      const latest = [...sent].reverse().find((entry) => entry.type === BANK)
       expect(latest?.type).toBe(BANK)
       return latest?.message as BankResult
+    },
+    banks() {
+      return sent.filter((entry) => entry.type === BANK)
     },
   }
 }
@@ -146,16 +168,38 @@ interface Banked {
  * hands back a promise of its own, which is how the concurrent cases hold two
  * requests open at once without a timer.
  */
-function room(bank?: BankPresses) {
+function room(bank?: BankPresses, roomId = 'button-room-1') {
   const presses = new PressRegistry()
   const calls: Banked[] = []
+  let challengeNumber = 0
   const issue: BankPresses = async (address, count) => {
     calls.push({ address, presses: count })
     return bank ? await bank(address, count) : bundleFor(count)
   }
-  const button = new (createButtonRoom({ bank: issue, registry: presses }))()
+  const button = new (createButtonRoom({
+    bank: issue,
+    registry: presses,
+    challengeTokens: () => {
+      challengeNumber += 1
+      return {
+        playerId: challengeNumber.toString(16).padStart(64, '0'),
+        nonce: (challengeNumber + 1_000).toString(16).padStart(64, '0'),
+      }
+    },
+  }))()
+  ;(button as { roomId: string }).roomId = roomId
   button.onCreate()
   return { room: button, presses, calls }
+}
+
+async function authenticate(button: ButtonRoom, client: ReturnType<typeof stub>, keys: KeyPair): Promise<void> {
+  button.onJoin(asClient(client), { address: keys.address })
+  const challengeEnvelope = [...client.sent].reverse().find((entry) => entry.type === AUTH_CHALLENGE)
+  expect(challengeEnvelope?.type).toBe(AUTH_CHALLENGE)
+  const challenge = challengeEnvelope?.message as OwnershipChallengeMessage
+  const signature = await signHash(keys.privateKey, challenge.hash)
+  expect(await button.authenticate(client, { signature })).toEqual({ ok: true })
+  expect(client.sent.at(-1)).toEqual({ type: AUTH_RESULT, message: { ok: true } })
 }
 
 describe('the room around it', () => {
@@ -168,22 +212,22 @@ describe('the room around it', () => {
     expect(() => button.onJoin(asClient(alice))).toThrow('kei address')
   })
 
-  test('presses land under the address the session joined with', () => {
+  test('presses land under the address the session authenticated with', async () => {
     const { room: button, presses } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
 
     expect(button.press(alice, 3)).toBe(3)
     expect(button.press(alice, { presses: 2 })).toBe(2)
     expect(presses.pending(ALICE)).toBe(5)
   })
 
-  test('a press message cannot name an address', () => {
+  test('a press message cannot name an address', async () => {
     const { room: button, presses } = room()
     const alice = stub('a')
     const bob = stub('b')
-    button.onJoin(asClient(alice), { address: ALICE })
-    button.onJoin(asClient(bob), { address: BOB })
+    await authenticate(button, alice, ALICE_KEYS)
+    await authenticate(button, bob, BOB_KEYS)
 
     button.press(bob, { address: ALICE, presses: 4 })
     expect(presses.pending(ALICE)).toBe(0)
@@ -196,10 +240,10 @@ describe('the room around it', () => {
     expect(presses.pending(ALICE)).toBe(0)
   })
 
-  test('a dropped socket does not drop presses that were observed', () => {
+  test('a dropped socket does not drop presses that were observed', async () => {
     const { room: button, presses } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 4)
     button.onLeave(asClient(alice))
 
@@ -209,15 +253,15 @@ describe('the room around it', () => {
     expect(presses.consume(ALICE, 4)).toBe(4)
   })
 
-  test('a reconnecting player keeps pressing into the same tally', () => {
+  test('a reconnecting player keeps pressing into the same tally', async () => {
     const { room: button, presses } = room()
     const first = stub('a')
     const second = stub('b')
-    button.onJoin(asClient(first), { address: ALICE })
+    await authenticate(button, first, ALICE_KEYS)
     button.press(first, 2)
     button.onLeave(asClient(first))
 
-    button.onJoin(asClient(second), { address: ALICE })
+    await authenticate(button, second, ALICE_KEYS)
     button.press(second, 3)
     expect(presses.consume(ALICE, 100)).toBe(5)
   })
@@ -227,7 +271,7 @@ describe('banking what the room saw', () => {
   test('a successful bank spends the presses once and answers the request', async () => {
     const { room: button, presses, calls } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 6)
 
     const result = await button.bank(alice, { id: 'r1', presses: 6 })
@@ -245,7 +289,7 @@ describe('banking what the room saw', () => {
   test('the issuer is told what the server saw, not what was asked for', async () => {
     const { room: button, calls } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 3)
 
     const result = await button.bank(alice, { id: 7, presses: 1_000_000 })
@@ -256,7 +300,7 @@ describe('banking what the room saw', () => {
   test('presses nobody observed are refused and never reach the issuer', async () => {
     const { room: button, calls } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
 
     expect(await button.bank(alice, { id: 'x', presses: 50 })).toEqual({
       ok: false,
@@ -264,15 +308,15 @@ describe('banking what the room saw', () => {
       error: 'The server saw no presses to bank.',
     })
     expect(calls).toEqual([])
-    expect(alice.sent).toHaveLength(1)
+    expect(alice.banks()).toHaveLength(1)
   })
 
   test('a bank message cannot name an address or invent a count', async () => {
     const { room: button, presses, calls } = room()
     const alice = stub('a')
     const bob = stub('b')
-    button.onJoin(asClient(alice), { address: ALICE })
-    button.onJoin(asClient(bob), { address: BOB })
+    await authenticate(button, alice, ALICE_KEYS)
+    await authenticate(button, bob, BOB_KEYS)
     button.press(alice, 8)
 
     // Bob asks for Alice's presses, by name and by count. He has none of his own.
@@ -295,9 +339,35 @@ describe('banking what the room saw', () => {
     expect(await button.bank(ghost, { id: 'g', presses: 4 })).toEqual({
       ok: false,
       id: 'g',
-      error: 'Join before banking.',
+      error: 'Authenticate your Kei wallet before banking.',
     })
     expect(calls).toEqual([])
+  })
+
+  test('bank correlation ids are bounded before they are echoed', async () => {
+    const { room: button } = room()
+    const ghost = stub('ghost-ids')
+    const accessor = {}
+    Object.defineProperty(accessor, 'id', {
+      enumerable: true,
+      get() {
+        throw new Error('an untrusted getter ran')
+      },
+    })
+
+    for (const id of ['x'.repeat(65), NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, {}]) {
+      expect(await button.bank(ghost, { id, presses: 1 })).toMatchObject({ ok: false, id: null })
+    }
+    expect(await button.bank(ghost, accessor)).toMatchObject({ ok: false, id: null })
+
+    expect(await button.bank(ghost, { id: 'x'.repeat(64), presses: 1 })).toMatchObject({
+      ok: false,
+      id: 'x'.repeat(64),
+    })
+    expect(await button.bank(ghost, { id: Number.MAX_SAFE_INTEGER, presses: 1 })).toMatchObject({
+      ok: false,
+      id: Number.MAX_SAFE_INTEGER,
+    })
   })
 
   test('a failed bank restores exactly what it reserved', async () => {
@@ -306,7 +376,7 @@ describe('banking what the room saw', () => {
     }
     const { room: button, presses, calls } = room(failing)
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 10)
     button.press(alice, 2)
 
@@ -318,13 +388,13 @@ describe('banking what the room saw', () => {
     // The whole tally, including the part the cap would refuse as a new message.
     expect(await button.bank(alice, { id: 'r2', presses: 12 })).toMatchObject({ ok: false })
     expect(presses.pending(ALICE)).toBe(12)
-    expect(alice.sent).toHaveLength(2)
+    expect(alice.banks()).toHaveLength(2)
   })
 
   test('a claim that cannot be delivered is still paid for', async () => {
     const { room: button, presses, calls } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 6)
 
     // Same session, but the socket dies while the answer is going out — after
@@ -354,8 +424,8 @@ describe('banking what the room saw', () => {
     const { room: button, presses } = room(failing)
     const alice = stub('a')
     const bob = stub('b')
-    button.onJoin(asClient(alice), { address: ALICE })
-    button.onJoin(asClient(bob), { address: BOB })
+    await authenticate(button, alice, ALICE_KEYS)
+    await authenticate(button, bob, BOB_KEYS)
     button.press(alice, 4)
     button.press(bob, 3)
 
@@ -375,7 +445,7 @@ describe('banking what the room saw', () => {
     }
     const { room: button, presses, calls } = room(slow)
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 10)
 
     const first = button.bank(alice, { id: 'a', presses: 6 })
@@ -393,7 +463,7 @@ describe('banking what the room saw', () => {
       { address: ALICE, presses: 4 },
     ])
     expect(presses.pending(ALICE)).toBe(0)
-    expect(alice.sent).toHaveLength(2)
+    expect(alice.banks()).toHaveLength(2)
   })
 
   test('a third bank behind two in flight gets nothing rather than a repeat', async () => {
@@ -407,7 +477,7 @@ describe('banking what the room saw', () => {
     }
     const { room: button, calls } = room(slow)
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 5)
 
     const inFlight = [
@@ -425,13 +495,13 @@ describe('banking what the room saw', () => {
   test('the bank message handler answers over the same client', async () => {
     const { room: button, calls } = room()
     const alice = stub('a')
-    button.onJoin(asClient(alice), { address: ALICE })
+    await authenticate(button, alice, ALICE_KEYS)
     button.press(alice, 2)
 
     // What Colyseus does when a `bank` message lands, minus the socket.
     await button.bank(asClient(alice), { id: 'wire', presses: 2 })
 
-    expect(alice.sent).toEqual([
+    expect(alice.banks()).toEqual([
       { type: BANK, message: { ok: true, id: 'wire', presses: 2, claim: bundleFor(2) } },
     ])
     expect(calls).toEqual([{ address: ALICE, presses: 2 }])

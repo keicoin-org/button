@@ -18,6 +18,9 @@
   "dependencies": {
     "@babylonjs/core": "^9.19.0",
     "@colyseus/core": "^0.16.24",
+    "@colyseus/ws-transport": "^0.16.0",
+    "@keicoin/core": "^0.2.0",
+    "colyseus.js": "^0.16.22",
     "kei-transaction": "^0.2.0"
   },
   "devDependencies": {
