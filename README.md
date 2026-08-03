@@ -34,6 +34,36 @@ worth, and what things cost.
 | **Buy** | Click a row on the shop board. You transfer coins; the shopkeeper mints you the item and burns the coins. |
 | **Exchange** | Optional. Pay Kei, get coins at the posted rate. Turn it off and the game is unchanged. |
 
+### What the screen is allowed to call a balance
+
+A clicker has to answer the finger immediately, and a chain does not. The screen
+therefore shows three deliberately different figures:
+
+- **COUNTED** is the headline tally. It includes this browser's unbanked and
+  clearing rewards, so it moves on the press itself; it is not a balance.
+- **AVAILABLE TO SPEND** is the confirmed balance read from the chain.
+- **CLEARING** is counted but unconfirmed and explicitly not spendable yet.
+
+`src/ledger.ts` keeps each coin in one accounting stage:
+
+| stage | what it means |
+|---|---|
+| `unbanked` | pressed for, counted by this browser, the server has not been asked yet |
+| `banking` | the server is pricing them; no proof back |
+| `settling` | on their way: something is out that the chain is expected to pay out — a signed proof waiting on this wallet's claim, or a payment waiting on the issuer's mint |
+| `confirmed` | accepted chain state (SPEC §5.5) — the balance, and the only spendable figure |
+
+Affordability and the client-side gate before `/game/order` read only
+`confirmed`; the server then checks the chain itself and remains authoritative.
+Moving a reward between stages keeps COUNTED stable, while a server rate cap or
+failed claim rolls it back to the supported amount. Banks are serialized through
+claim completion so two SDK claim sweeps cannot race the same proof.
+
+CLEARING is session bookkeeping, not chain state. Reloading loses unbanked
+presses and in-memory claim bundles, and unrelated inbound transfers can make the
+clearing estimate briefly conservative. Neither case can increase AVAILABLE TO
+SPEND or make a shop row affordable.
+
 ### Why banking instead of minting
 
 Minting per press would put every player's reward on the issuer's chain, and one
@@ -61,6 +91,7 @@ shared/catalogue.ts   what a press is worth and what upgrades cost — used by b
 server/game.ts        the issuer: token, items, the batcher, the shop. The whole backend.
 server/main.ts        one Bun server: the mock node at /rpc, the game at /game/*, the client at /
 src/economy.ts        every line of Kei in the client
+src/ledger.ts         where a coin is — counted, clearing, or confirmed. Pure arithmetic.
 src/world.ts          Babylon: the button, the screen, the shopkeeper
 src/screen.ts         what the two in-world screens draw
 ```

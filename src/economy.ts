@@ -20,11 +20,28 @@ import {
   type CataloguePayload,
   type Upgrade,
 } from '../shared/catalogue.js'
+import {
+  banked,
+  bankingFailed,
+  bankingStarted,
+  canAfford,
+  claimExpected,
+  claimFailed,
+  clearingNote,
+  emptyLedger,
+  pressed,
+  purchaseBlock,
+  reconcileConfirmed,
+  type CoinLedger,
+} from './ledger.js'
 
 export interface ShopRow extends Upgrade {
   asset: string
   owned: number
+  /** Confirmed coins only. Nothing still clearing has ever made a row affordable. */
   affordable: boolean
+  /** How far off the row is, and whether waiting would cover it. Null when buyable. */
+  note: string | null
 }
 
 export interface EconomyState {
@@ -33,17 +50,21 @@ export interface EconomyState {
   /** False when the node or the game server could not be reached. */
   online: boolean
   kei: number
-  coins: number
-  /** Presses this browser has made and not yet banked. */
-  unbanked: number
   /**
-   * Coins this browser has pressed for and the chain has not paid out yet —
-   * presses still unbanked, plus whatever is in flight. Shown beside the
-   * balance and never added to it: `coins` is what the chain says, and this is
-   * what is still owed. Drained by real confirmations rather than by `bank`
-   * starting, so it does not blink to zero while a batch is in flight.
+   * Every coin this browser knows about, by how far along it is. `confirmed` is
+   * the balance; the rest is owed. Nothing outside `src/ledger.ts` is allowed to
+   * add them together and call the result a balance.
    */
-  pendingCoins: number
+  coins: CoinLedger
+  /** Presses this browser has made and not yet handed to the game. */
+  unbankedPresses: number
+  /**
+   * A batch is out: somewhere between asking the game to price it and this
+   * wallet's claim for it being written. It is one flag for the whole of that,
+   * because `coins.banking` empties as soon as the proof arrives and the claim
+   * is still to come — the screen would say the batch had landed while the part
+   * that lands it had not run.
+   */
   banking: boolean
   perPress: number
   pressesPerSecond: number
@@ -84,9 +105,8 @@ export async function connect(): Promise<Economy> {
     network: 'offline',
     online: false,
     kei: 0,
-    coins: 0,
-    unbanked: 0,
-    pendingCoins: 0,
+    coins: emptyLedger(),
+    unbankedPresses: 0,
     banking: false,
     perPress: 1,
     pressesPerSecond: 0,
@@ -97,6 +117,13 @@ export async function connect(): Promise<Economy> {
   }
 
   const changed = (): void => {
+    // Every row is re-priced against the ledger on every change, so there is no
+    // path where a press moves the headline and leaves a row saying something
+    // the confirmed balance does not support.
+    for (const row of state.upgrades) {
+      row.affordable = canAfford(state.coins, row.price)
+      row.note = clearingNote(state.coins, row.price)
+    }
     for (const listener of listeners) listener(state)
   }
   const say = (error: unknown): void => {
@@ -142,14 +169,18 @@ export async function connect(): Promise<Economy> {
   const apply = (summary: WalletSummary): void => {
     const held = summary.tokens.find((token) => token.asset === catalogue.coin.asset)
     state.kei = summary.kei
-    state.coins = held?.amount ?? 0
+    // The chain's figure lands in `confirmed`, and the rise it represents comes
+    // straight out of `settling` — so a claim landing moves coins between two
+    // stages instead of appearing in both.
+    state.coins = reconcileConfirmed(state.coins, held?.amount ?? 0)
     state.claiming = summary.pending.length
 
     const owned: Record<string, number> = {}
     state.upgrades = catalogue.upgrades.map((upgrade) => {
       const count = summary.items.find((item) => item.asset === upgrade.asset)?.count ?? 0
       if (count > 0) owned[upgrade.sku] = count
-      return { ...upgrade, owned: count, affordable: state.coins >= upgrade.price }
+      // `changed()` prices it; affordability is never computed in two places.
+      return { ...upgrade, owned: count, affordable: false, note: null }
     })
 
     const payout = payoutFor(owned)
@@ -165,20 +196,33 @@ export async function connect(): Promise<Economy> {
   // ------------------------------------------------------------------ banking
 
   let timer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Whether a batch is out. Owned here rather than read off the ledger, because
+   * no ledger stage covers the whole of a bank: `banking` empties the instant
+   * the proof arrives, and the claim that turns the proof into coins is written
+   * after that. See `bank()` for what gets in through the gap.
+   */
+  let inFlight = false
 
   /** A bundle's amount is raw units; every other figure in this file is display units. */
   const paid = (bundle: ClaimBundle): number =>
     Number(bundle.amount) / 10 ** catalogue.coin.decimals
 
-  const bank = async (): Promise<void> => {
-    if (timer) clearTimeout(timer)
-    timer = undefined
-    const presses = state.unbanked
-    if (presses <= 0 || state.banking) return
-
-    state.unbanked = 0
-    state.banking = true
+  /**
+   * Ask the game to price a batch, take the proof, write the claim.
+   *
+   * Only `bank()` calls this, and only one call is ever running: every stage
+   * move in here assumes it is the only thing moving them.
+   */
+  const runBank = async (presses: number): Promise<void> => {
+    // Both figures move together and are remembered together, because if the
+    // fetch fails they both go back.
+    const expected = state.coins.unbanked
+    state.unbankedPresses = 0
+    state.coins = bankingStarted(state.coins)
     changed()
+
+    let bundle: ClaimBundle
     try {
       const response = await fetch(at('/game/bank'), {
         method: 'POST',
@@ -187,32 +231,87 @@ export async function connect(): Promise<Economy> {
       })
       const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
       if (body.error || !body.bundle) throw new Error(body.error ?? 'The game server sent no proof back.')
+      bundle = body.bundle
+    } catch (error) {
+      // Nothing was signed, so the presses are still owed. They go back to
+      // where they were and the headline does not move.
+      state.unbankedPresses += presses
+      state.coins = bankingFailed(state.coins, expected)
+      say(error)
+      return
+    }
 
+    // What the chain will pay, rather than what the presses were hoped to be
+    // worth: the server caps a bank that arrived too fast to be a hand
+    // (server/game.ts's bank()), and the bundle carries the capped figure. The
+    // headline drops to it here, once, at the moment the truth arrives.
+    const amount = paid(bundle)
+    state.coins = banked(state.coins, expected, amount)
+    state.message = null
+    changed()
+
+    try {
       // From here the game is not involved. The bundle is an entitlement, and
       // the claim that collects it is written by this wallet, from this account,
       // in parallel with every other player claiming off the same root (§5.5).
-      await kei.claims.add(body.bundle)
-      // Drained by what the chain actually paid, not by what the presses were
-      // hoped to be worth: the server caps a bank that arrived too fast to be
-      // a hand (server/game.ts's bank()), and the bundle carries the capped
-      // figure. Those coins have landed, so they are no longer owed.
-      state.pendingCoins = Math.max(0, state.pendingCoins - paid(body.bundle))
-      state.message = null
+      // Nothing is drained here: `reconcileConfirmed` takes these coins out of
+      // `settling` when the chain's own figure rises, which is the same event
+      // seen from the side that can be trusted.
+      await kei.claims.add(bundle)
     } catch (error) {
-      // Nothing was minted, so the presses are still owed. Put them back.
-      // `pendingCoins` is untouched — it was never drained for this batch.
-      state.unbanked += presses
+      // They leave the tally rather than going back to `unbanked` — the game
+      // already paid for those presses, and pressing them again is not what
+      // happened. The SDK keeps the bundle it was handed, so it is still listed
+      // by `claims.pending()` and the next `claims.add` retries it; the coins
+      // come back as a rise in the chain's figure if that retry lands. Counting
+      // them as clearing meanwhile would be a promise this browser cannot keep.
+      state.coins = claimFailed(state.coins, amount)
       say(error)
+    }
+    changed()
+  }
+
+  const bank = async (): Promise<void> => {
+    if (timer) clearTimeout(timer)
+    timer = undefined
+    // One batch at a time, and one batch means all three steps of it. A second
+    // bank starting while the first is between its proof and its claim would
+    // reach a second `kei.claims.add`, and the SDK claims out of one shared map
+    // of held bundles: both calls run `claimAll()`, both can read the same
+    // bundle before either has submitted it, and the loser gets told the root is
+    // already claimed. That failure then rolls back this file's `settling` by
+    // its own batch's amount, which is not the amount that failed.
+    //
+    // The presses that arrived meanwhile stay counted and unbanked, and the
+    // timer goes back rather than being dropped: nothing else would come back
+    // for them, so a player who presses twice during a bank and then stops
+    // would be owed them forever. Pressing again once the batch is home banks
+    // them on that press; stopping banks them on this timer.
+    if (inFlight) {
+      timer = setTimeout(() => void bank(), BANK_AFTER_MS)
+      return
+    }
+    const presses = state.unbankedPresses
+    if (presses <= 0) return
+
+    inFlight = true
+    state.banking = true
+    try {
+      await runBank(presses)
     } finally {
+      inFlight = false
       state.banking = false
       changed()
     }
   }
 
   const press = (times = 1): void => {
-    state.unbanked += times
-    state.pendingCoins += times * state.perPress
-    if (state.unbanked >= BANK_AFTER_PRESSES) void bank()
+    // The headline moves on this line, before anything is awaited. That is the
+    // whole requirement: the number answers the finger, and it answers it as a
+    // count of presses rather than as a balance.
+    state.unbankedPresses += times
+    state.coins = pressed(state.coins, times * state.perPress)
+    if (state.unbankedPresses >= BANK_AFTER_PRESSES) void bank()
     else timer ??= setTimeout(() => void bank(), BANK_AFTER_MS)
     changed()
   }
@@ -231,6 +330,18 @@ export async function connect(): Promise<Economy> {
     async buy(sku) {
       const upgrade = state.upgrades.find((row) => row.sku === sku)
       if (!upgrade) return
+
+      // Confirmed coins only, and refused here rather than by the server. The
+      // server checks the chain and remains the authority — but a player whose
+      // headline reads 400 because 300 of it is clearing gets told which 400
+      // that was, instead of an order they cannot pay for.
+      const refusal = purchaseBlock(state.coins, upgrade.name, upgrade.price)
+      if (refusal !== null) {
+        state.message = refusal
+        changed()
+        return
+      }
+
       try {
         state.message = null
         const response = await fetch(at('/game/order'), {
@@ -261,8 +372,21 @@ export async function connect(): Promise<Economy> {
         })
         const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
         if (body.error || !body.bundle) throw new Error(body.error ?? 'The mob dropped no claim proof.')
-        await kei.claims.add(body.bundle)
-        state.message = 'Claimed 25 coins from the mob drop.'
+
+        // A drop is owed exactly like a banked press is, so it goes through the
+        // same stage. Registering it before claiming is what keeps the chain's
+        // next rise from draining somebody else's coins out of `settling`.
+        const amount = paid(body.bundle)
+        state.coins = claimExpected(state.coins, amount)
+        state.message = `Claiming ${Math.floor(amount)} coins from the mob drop.`
+        changed()
+        try {
+          await kei.claims.add(body.bundle)
+        } catch (error) {
+          state.coins = claimFailed(state.coins, amount)
+          throw error
+        }
+        state.message = `Claimed ${Math.floor(amount)} coins from the mob drop.`
         changed()
       } catch (error) {
         say(error)
@@ -270,13 +394,39 @@ export async function connect(): Promise<Economy> {
     },
 
     async topUp(amount) {
+      // A payment the issuer is not watching for, or one it is going to ignore
+      // as a rounding error, buys nothing — and coins registered as owed for it
+      // would sit in `settling` forever, since nothing is ever going to confirm
+      // them. Both are refused here rather than paid for.
+      if (!state.exchange.open) {
+        state.message = 'The exchange desk is closed. Press the button instead.'
+        changed()
+        return
+      }
+      if (amount < state.exchange.minimum) {
+        state.message = `The desk takes ${state.exchange.minimum} Kei at a time or more.`
+        changed()
+        return
+      }
+
+      // The issuer mints against this payment, and that mint reaches the wallet
+      // as a rise in the chain's figure. Every rise is drained out of
+      // `settling`, so the coins it will pay for are put there before the
+      // payment goes out — registering them afterwards leaves a window in which
+      // the mint arrives first and drains a banked press instead.
+      const owed = amount * state.exchange.coinsPerKei
+      state.coins = claimExpected(state.coins, owed)
+      state.message = null
+      changed()
+
       try {
-        state.message = null
         if ((await kei.balance()) < amount && catalogue.network !== 'mainnet') await kei.faucet()
         await kei.pay({ to: catalogue.issuer, amount })
         state.message = `Paid ${amount} Kei. Coins on the way.`
         changed()
       } catch (error) {
+        // Nothing was paid, so nothing is owed for it.
+        state.coins = claimFailed(state.coins, owed)
         say(error)
       }
     },
@@ -302,10 +452,11 @@ function offline(
   return {
     state,
     press(times = 1) {
-      state.unbanked += times
-      // Owed by a game that is not there, which is the honest reading of it:
-      // the message line already says nothing is being banked.
-      state.pendingCoins += times * state.perPress
+      state.unbankedPresses += times
+      // Counted and unbanked, which is the honest reading of it: there is no
+      // game to bank them, so they stay in the stage that means "owed", nothing
+      // is ever confirmed, and nothing in the shop becomes affordable.
+      state.coins = pressed(state.coins, times * state.perPress)
       changed()
     },
     async buy() {
