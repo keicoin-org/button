@@ -79,6 +79,11 @@ export class Arena extends DurableObject<Env> {
           return json(await game.order(address, sku))
         }
 
+        case '/game/loot': {
+          const { address, mob } = await body<{ address: string; mob: string }>(request)
+          return json({ bundle: await game.loot(address, mob) })
+        }
+
         default:
           return new Response('Not found', { status: 404 })
       }
