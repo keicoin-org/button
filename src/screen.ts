@@ -9,6 +9,7 @@
  */
 
 import type { EconomyState } from './economy.js'
+import { clearingCovers, countedCoins, pendingCoins, spendableCoins } from './ledger.js'
 
 type Ctx = CanvasRenderingContext2D
 
@@ -45,60 +46,88 @@ function panel(ctx: Ctx, width: number, height: number): void {
   ctx.strokeRect(3, 3, width - 6, height - 6)
 }
 
+/**
+ * Three numbers, and the words that keep them apart.
+ *
+ * The big one is COUNTED, because it is what this browser has counted and it
+ * moves on the press itself — that is what makes the button feel like a button.
+ * It is labelled rather than left to be read as a balance, and the two figures
+ * under it say which part of it is which: AVAILABLE TO SPEND is the chain's,
+ * CLEARING is owed. The shop only ever spends the first one.
+ */
 export function drawBalance(ctx: Ctx, state: EconomyState): void {
   const { width, height } = BALANCE_SIZE
   panel(ctx, width, height)
 
+  const counted = countedCoins(state.coins)
+  const spendable = spendableCoins(state.coins)
+  const clearing = pendingCoins(state.coins)
+
   ctx.textBaseline = 'alphabetic'
   ctx.textAlign = 'left'
   ctx.fillStyle = DIM
-  ctx.font = `600 26px ${FONT}`
-  ctx.fillText('COINS', 34, 62)
+  ctx.font = `600 24px ${FONT}`
+  ctx.fillText('COUNTED', 34, 58)
 
-  // The chain's figure, and nothing added to it. What a press has earned and
-  // not been paid for yet is the amber number on the right, which moves on the
-  // press itself — so the screen still answers instantly without this one
-  // being a guess, and without it disagreeing with the shop board.
-  ctx.fillStyle = state.online ? GREEN : RED
-  ctx.font = `700 108px ${MONO}`
-  ctx.fillText(number(state.coins), 30, 168)
-
-  ctx.font = `500 28px ${FONT}`
-  ctx.fillStyle = INK
-  ctx.fillText(`+${number(state.perPress)} per press`, 34, 222)
-  if (state.pressesPerSecond > 0) {
-    ctx.fillStyle = DIM
-    ctx.fillText(`${state.pressesPerSecond}/s automatic`, 34, 262)
-  }
-
-  // Counted in coins rather than presses, because coins are what the player is
-  // waiting for, and because this is the number the green one is not allowed
-  // to include until the chain has paid it.
   ctx.textAlign = 'right'
-  ctx.fillStyle = state.pendingCoins > 0 ? AMBER : DIM
-  ctx.font = `600 30px ${MONO}`
-  ctx.fillText(
-    state.pendingCoins > 0 ? `+${number(state.pendingCoins)} pending` : 'all banked',
-    width - 34,
-    222,
-  )
+  ctx.font = `500 24px ${FONT}`
+  const rate = state.pressesPerSecond > 0
+    ? `+${number(state.perPress)} per press · ${state.pressesPerSecond}/s auto`
+    : `+${number(state.perPress)} per press`
+  ctx.fillText(rate, width - 34, 58)
+
+  // Ink rather than green: green is reserved for the confirmed figure below, so
+  // that the colour never says "spendable" about a number that includes presses
+  // the chain has not paid for yet.
+  ctx.textAlign = 'left'
+  ctx.fillStyle = state.online ? INK : RED
+  ctx.font = `700 96px ${MONO}`
+  ctx.fillText(number(counted), 30, 148)
+
+  ctx.strokeStyle = '#1f3a2c'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(34, 170)
+  ctx.lineTo(width - 34, 170)
+  ctx.stroke()
 
   ctx.fillStyle = DIM
-  ctx.font = `500 24px ${MONO}`
+  ctx.font = `600 19px ${FONT}`
+  ctx.fillText('AVAILABLE TO SPEND', 34, 198)
+  ctx.fillText('CLEARING', 286, 198)
+
+  ctx.fillStyle = state.online ? GREEN : RED
+  ctx.font = `700 42px ${MONO}`
+  ctx.fillText(number(spendable), 34, 240)
+
+  ctx.fillStyle = clearing > 0 ? AMBER : DIM
+  ctx.fillText(clearing > 0 ? number(clearing) : '0', 286, 240)
+
+  // What the clearing figure is waiting on, in the words of the loop: banked
+  // presses waiting for a proof, and proofs waiting for the chain.
+  ctx.fillStyle = DIM
+  ctx.font = `500 19px ${FONT}`
+  ctx.fillText(clearing > 0 ? 'not spendable yet' : 'all confirmed', 286, 264)
+
+  ctx.textAlign = 'right'
+  ctx.fillStyle = DIM
+  ctx.font = `500 22px ${MONO}`
   const kei = state.online ? `${state.kei.toFixed(3)} kei` : 'offline'
+  // `state.banking` and not `coins.banking`, because a batch is still out while
+  // its claim is being written and that stage is empty by then.
   const keiStatus = state.banking ? 'banking…' : state.claiming > 0 ? 'claiming…' : kei
   if (state.online && KEI_COIN.complete && KEI_COIN.naturalWidth > 0) {
     const labelWidth = ctx.measureText(keiStatus).width
-    ctx.drawImage(KEI_COIN, width - 34 - labelWidth - 39, 232, 32, 32)
+    ctx.drawImage(KEI_COIN, width - 34 - labelWidth - 37, 216, 28, 28)
   }
-  ctx.fillText(keiStatus, width - 34, 262)
+  ctx.fillText(keiStatus, width - 34, 238)
 
   // The message line is the only place errors are shown, and they are shown as
   // the SDK wrote them (SPEC §6.1).
   ctx.textAlign = 'left'
   ctx.font = `500 21px ${FONT}`
   ctx.fillStyle = state.message ? AMBER : DIM
-  wrap(ctx, state.message ?? state.address, 34, 306, width - 68, 26, 2)
+  wrap(ctx, state.message ?? state.address, 34, 302, width - 68, 26, 2)
 }
 
 export function drawShop(ctx: Ctx, state: EconomyState): Row[] {
@@ -111,41 +140,65 @@ export function drawShop(ctx: Ctx, state: EconomyState): Row[] {
   ctx.font = `700 32px ${FONT}`
   ctx.fillText('SHOP', 30, 52)
 
+  // The header spends the same word the balance screen does. A row is priced
+  // against this figure and nothing else, so the number the shop shows is the
+  // number it is willing to act on.
+  const clearing = pendingCoins(state.coins)
   ctx.textAlign = 'right'
   ctx.fillStyle = GREEN
-  ctx.font = `600 30px ${MONO}`
-  ctx.fillText(`${number(state.coins)} coins`, width - 30, 52)
+  ctx.font = `600 28px ${MONO}`
+  ctx.fillText(`${number(spendableCoins(state.coins))} to spend`, width - 30, 44)
+
+  ctx.fillStyle = clearing > 0 ? AMBER : DIM
+  ctx.font = `500 19px ${MONO}`
+  ctx.fillText(clearing > 0 ? `${number(clearing)} still clearing` : 'nothing clearing', width - 30, 68)
 
   const rows: Row[] = []
-  let y = 78
+  let y = 88
 
   for (const upgrade of state.upgrades) {
     const top = y
-    const bottom = y + 76
+    const bottom = y + 66
     rows.push({ target: upgrade.sku, top, bottom })
 
     ctx.fillStyle = '#132318'
-    ctx.fillRect(18, top + 4, width - 36, 68)
+    ctx.fillRect(18, top + 2, width - 36, 62)
 
-    const affordable = state.coins >= upgrade.price
     ctx.textAlign = 'left'
-    ctx.fillStyle = affordable ? INK : DIM
-    ctx.font = `600 27px ${FONT}`
-    ctx.fillText(upgrade.name, 34, top + 36)
-
-    ctx.fillStyle = DIM
-    ctx.font = `400 20px ${FONT}`
-    ctx.fillText(upgrade.description, 34, top + 62)
-
-    ctx.textAlign = 'right'
-    ctx.fillStyle = affordable ? AMBER : DIM
-    ctx.font = `600 26px ${MONO}`
-    ctx.fillText(number(upgrade.price), width - 36, top + 36)
+    ctx.fillStyle = upgrade.affordable ? INK : DIM
+    ctx.font = `600 26px ${FONT}`
+    ctx.fillText(upgrade.name, 34, top + 30)
 
     if (upgrade.owned > 0) {
+      const nameWidth = ctx.measureText(upgrade.name).width
       ctx.fillStyle = GREEN
-      ctx.font = `600 22px ${MONO}`
-      ctx.fillText(`owned ×${upgrade.owned}`, width - 36, top + 62)
+      ctx.font = `600 20px ${MONO}`
+      ctx.fillText(`×${upgrade.owned}`, 44 + nameWidth, top + 30)
+    }
+
+    // The note shares a line with the description, so it is measured before the
+    // description is drawn and the description gets what is left. The longest
+    // one here is wider than the gap a shortfall leaves, and two strings drawn
+    // over each other are not a legible answer to "why can I not buy this".
+    ctx.font = `500 18px ${MONO}`
+    const noteWidth = upgrade.note ? ctx.measureText(upgrade.note).width + 18 : 0
+
+    ctx.fillStyle = DIM
+    ctx.font = `400 19px ${FONT}`
+    ctx.fillText(clip(ctx, upgrade.description, width - 70 - noteWidth), 34, top + 54)
+
+    ctx.textAlign = 'right'
+    ctx.fillStyle = upgrade.affordable ? AMBER : DIM
+    ctx.font = `600 25px ${MONO}`
+    ctx.fillText(number(upgrade.price), width - 36, top + 30)
+
+    // Why a row is out of reach, in the row itself: how short it is, and
+    // whether waiting for the clearing coins would be enough. Amber for the
+    // second case, because that one is answered by waiting rather than pressing.
+    if (upgrade.note) {
+      ctx.fillStyle = clearingCovers(state.coins, upgrade.price) ? AMBER : DIM
+      ctx.font = `500 18px ${MONO}`
+      ctx.fillText(upgrade.note, width - 36, top + 54)
     }
 
     y = bottom + 6
@@ -182,6 +235,15 @@ export function drawPop(ctx: Ctx, width: number, height: number, text: string): 
   ctx.strokeText(text, width / 2, height / 2)
   ctx.fillStyle = AMBER
   ctx.fillText(text, width / 2, height / 2)
+}
+
+/** As much of `text` as fits `maxWidth`, cut on a character with an ellipsis. */
+function clip(ctx: Ctx, text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return ''
+  if (ctx.measureText(text).width <= maxWidth) return text
+  let cut = text.length
+  while (cut > 0 && ctx.measureText(`${text.slice(0, cut)}…`).width > maxWidth) cut--
+  return cut > 0 ? `${text.slice(0, cut)}…` : ''
 }
 
 function wrap(ctx: Ctx, text: string, x: number, y: number, maxWidth: number, lineHeight: number, maxLines: number): void {
