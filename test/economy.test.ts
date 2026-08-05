@@ -14,7 +14,8 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
-import { startGame } from '../server/game.js'
+import { describePurchase, type PurchaseRecord } from '../shared/purchases.js'
+import { startGame, type Game } from '../server/game.js'
 import { ORIGIN, bank, batchId, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
@@ -408,6 +409,141 @@ describe('the shop', () => {
     const { game, session } = await table()
     await expect(game.order(session, ORIGIN, 'a-second-house')).rejects.toThrow('does not sell "a-second-house"')
   }, 20_000)
+})
+
+/**
+ * Issue #20: which of the two endings a purchase reached.
+ *
+ * The shop already reaches one of them for every arrival — the item, or the
+ * coins back (#11, PR #13). What the player could see of that was one optimistic
+ * sentence that never resolved, identically, in both cases. These tests are
+ * about the channel that tells them apart, and they check the same thing every
+ * time: that a settled purchase names its ending, and names the item by its
+ * on-chain name rather than by a hex asset id (kei-transaction#130).
+ */
+describe('a purchase says how it ended', () => {
+  const settledFor = async (game: Game, session: string, what: string): Promise<PurchaseRecord> => {
+    let entry: PurchaseRecord | undefined
+    await until(async () => {
+      entry = game.purchases(session, ORIGIN).at(-1)
+      return entry !== undefined && entry.state !== 'open'
+    }, what)
+    return entry!
+  }
+
+  test('a delivered purchase is reported as arrived, by the item’s name', async () => {
+    const { game, player, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+    const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+
+    press(game, session, 400)
+    await player.claims.add(await bank(game, session))
+
+    const order = await game.order(session, ORIGIN, 'glove')
+    // Ordered and not paid for: the shop says so rather than saying nothing.
+    expect(game.purchases(session, ORIGIN).at(-1)).toMatchObject({ id: order.id, state: 'open', sku: 'glove' })
+
+    await coins.transfer(order.to, order.price)
+    const ended = await settledFor(game, session, 'the glove to be reported')
+
+    expect(ended.state).toBe('arrived')
+    expect(ended.id).toBe(order.id)
+    expect(ended.item).toBe('Springy Glove')
+    // The name a player reads is a name. The asset id never appears in it.
+    expect(describePurchase(ended)).toContain('Springy Glove')
+    expect(describePurchase(ended)).not.toContain(glove.asset)
+  }, 30_000)
+
+  test('a refunded purchase is reported as returned, with the amount and the reason', async () => {
+    const node = await MockNode.create()
+    let blocked: string | null = null
+    const game = await startGame({
+      seed: randomSeed(),
+      node: nodeRefusingToMint(node, () => blocked),
+      network: 'mock',
+      flushMs: 20,
+      pressRateCap: 100_000,
+    })
+    const player = await Kei.start({ node, seed: randomSeed() })
+    running.push(game, player)
+
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+    blocked = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!.asset
+
+    const session = await open(game, player)
+    press(game, session, 400)
+    await player.claims.add(await bank(game, session))
+
+    const order = await game.order(session, ORIGIN, 'glove')
+    await coins.transfer(order.to, order.price)
+    const ended = await settledFor(game, session, 'the refund to be reported')
+
+    // Before this, the refund and the delivery were the same thing to a player:
+    // one optimistic sentence and no second one.
+    expect(ended.state).toBe('returned')
+    expect(ended.id).toBe(order.id)
+    expect(ended.coins).toBe(order.price)
+    expect(ended.reason).toContain('could not deliver')
+    expect(describePurchase(ended)).toContain('came back')
+  }, 30_000)
+
+  test('a short payment is reported as returned, and the order stays open', async () => {
+    const { game, player, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+
+    press(game, session, 400)
+    await player.claims.add(await bank(game, session))
+
+    const order = await game.order(session, ORIGIN, 'knuckle')
+    await coins.transfer(order.to, 25)
+    const ended = await settledFor(game, session, 'the short payment to be reported')
+
+    expect(ended.state).toBe('returned')
+    expect(ended.coins).toBe(25)
+    expect(ended.reason).toContain('Brass Knuckle costs 150 coins and 25 arrived')
+  }, 30_000)
+
+  test('a wallet reads its own purchases and not another wallet’s', async () => {
+    const { game, player, node, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+
+    const { player: other } = await join(node)
+    running.push(other)
+    const theirs = await open(game, other)
+
+    press(game, session, 400)
+    await player.claims.add(await bank(game, session))
+    const order = await game.order(session, ORIGIN, 'glove')
+    await coins.transfer(order.to, order.price)
+    await settledFor(game, session, 'the glove to be reported')
+
+    // A second wallet, proved honestly, sees its own empty list. There is no
+    // argument to this that names an address, so there is nothing to point at
+    // somebody else's.
+    expect(game.purchases(theirs, ORIGIN)).toEqual([])
+  }, 30_000)
+
+  test('the record survives the order being spent, so a reload can still read it', async () => {
+    const { game, player, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+
+    press(game, session, 400)
+    await player.claims.add(await bank(game, session))
+    const order = await game.order(session, ORIGIN, 'glove')
+    await coins.transfer(order.to, order.price)
+    await settledFor(game, session, 'the glove to be reported')
+
+    // The order itself is deleted on delivery. What a reloaded page comes back
+    // to is this, filed against the wallet rather than against the page —
+    // proving the address again is all it takes to reach the answer.
+    const again = await open(game, player)
+    expect(game.purchases(again, ORIGIN).at(-1)).toMatchObject({ id: order.id, state: 'arrived' })
+  }, 30_000)
 })
 
 describe('mob loot', () => {

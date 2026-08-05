@@ -23,6 +23,7 @@
 import { Kei, type ClaimBundle, type PlayerToken, type WalletSummary } from 'kei-transaction'
 
 import type { OwnershipChallengeMessage } from '../shared/ownership.js'
+import { describePurchase, isSettled, type PurchaseRecord } from '../shared/purchases.js'
 
 import {
   payoutFor,
@@ -499,6 +500,91 @@ export async function connect(): Promise<Economy> {
    */
   const settled = (): Promise<unknown> => Promise.all([...inFlightPresses])
 
+  // ---------------------------------------------------------------- purchases
+
+  /**
+   * Which ending a purchase reached, asked for until there is one.
+   *
+   * A purchase is two signatures with a gap between them, and the gap is not
+   * this browser's to close: the player signs a transfer, the shop notices it on
+   * the chain, and the shop signs the delivery — or signs the coins back. So the
+   * outcome cannot be the return value of `buy()`, and before this there was no
+   * other channel for it. "It will arrive in a moment." was the last thing the
+   * player ever heard, whether the item landed, the coins came back, or neither.
+   *
+   * Polling rather than a socket, because the answer also has to survive a
+   * reload: the shop files the ending against the wallet, and the wallet is what
+   * a reloaded page still has. See `resume()`.
+   */
+  const PURCHASE_POLL_MS = 700
+  const PURCHASE_WAIT_MS = 45_000
+
+  let closed = false
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const purchasesNow = async (): Promise<PurchaseRecord[]> => {
+    const body = await withSession((id) => post<{ purchases?: PurchaseRecord[] }>('/game/purchases', { session: id }))
+    return body.purchases ?? []
+  }
+
+  /** Follow one order to its ending and say what it was. */
+  const watch = async (id: string): Promise<void> => {
+    const deadline = Date.now() + PURCHASE_WAIT_MS
+    while (!closed && Date.now() < deadline) {
+      await sleep(PURCHASE_POLL_MS)
+      let entry: PurchaseRecord | undefined
+      try {
+        entry = (await purchasesNow()).find((row) => row.id === id)
+      } catch {
+        // The shop is unreachable for a moment. The order is still on its books
+        // and the ending does not expire while this waits, so this asks again
+        // rather than inventing one.
+        continue
+      }
+      if (!entry || !isSettled(entry)) continue
+      state.message = describePurchase(entry)
+      changed()
+      return
+    }
+    if (closed) return
+    // Not an ending, and it does not claim to be one. The shop reaches the item
+    // or the coins back for every arrival (#11); what this cannot say is which,
+    // yet.
+    state.message =
+      'That purchase has not settled yet. The shop has your payment and ends every one of them in the item or the coins back — reload in a minute and it will say which.'
+    changed()
+  }
+
+  /**
+   * Pick up a purchase a reload interrupted.
+   *
+   * The record is kept against the wallet rather than against the page, so this
+   * is the case the issue is really about: a player who refreshes between paying
+   * and the item landing had, before this, no way back to the answer at all.
+   *
+   * An `arrived` ending is not re-announced, because the shop rows already show
+   * the item as owned and a sentence about it on every reload for ten minutes is
+   * noise. A refund is announced, because nothing else on the screen says it
+   * happened, and a refund the player cannot see is the thing this is for.
+   */
+  const resume = async (): Promise<void> => {
+    let list: PurchaseRecord[]
+    try {
+      list = await purchasesNow()
+    } catch {
+      return
+    }
+    const newest = list[list.length - 1]
+    if (!newest) return
+    if (!isSettled(newest)) {
+      if (newest.id) void watch(newest.id)
+      return
+    }
+    if (newest.state === 'arrived') return
+    state.message = describePurchase(newest)
+    changed()
+  }
+
   const press = (times = 1): void => {
     // The headline moves on this line, before anything is awaited. That is the
     // whole requirement: the number answers the finger, and it answers it as a
@@ -516,6 +602,10 @@ export async function connect(): Promise<Economy> {
   const auto = setInterval(() => {
     if (state.pressesPerSecond > 0) press(state.pressesPerSecond)
   }, 1_000)
+
+  // A purchase this wallet made before the page was reloaded is still on the
+  // shop's books, so this is where a refreshed tab gets back to the answer.
+  void resume()
 
   return {
     state,
@@ -542,7 +632,7 @@ export async function connect(): Promise<Economy> {
         // The order is placed for the proven wallet, so the transfer the shop
         // waits for is the one this browser is about to sign and no other.
         const order = await withSession((id) =>
-          post<{ to?: string; price?: number }>('/game/order', { session: id, sku }),
+          post<{ id?: string; to?: string; price?: number }>('/game/order', { session: id, sku }),
         )
         if (!order.to || order.price === undefined) throw new Error('The shop did not answer.')
         // The player signs the payment. The shop signs the delivery. There is no
@@ -550,6 +640,10 @@ export async function connect(): Promise<Economy> {
         await coins.transfer(order.to, order.price)
         state.message = `Bought ${upgrade.name}. It will arrive in a moment.`
         changed()
+        // And that sentence is now something that resolves. Not awaited: the
+        // shop settles from a chain subscription rather than from this request,
+        // so `buy()` returning is not the purchase ending.
+        if (order.id) void watch(order.id)
       } catch (error) {
         say(error)
       }
@@ -633,6 +727,7 @@ export async function connect(): Promise<Economy> {
     },
 
     close() {
+      closed = true
       clearInterval(auto)
       if (timer) clearTimeout(timer)
       kei.close()

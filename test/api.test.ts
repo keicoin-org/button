@@ -122,6 +122,39 @@ async function pressThrough(arena: Arena, session: string, times: number): Promi
   for (let index = 0; index < times; index++) await arena.door('/game/press', { session })
 }
 
+describe('a purchase can be asked how it ended', () => {
+  forEachDoor('the outcome is served over the same door the order was placed at', async (arena) => {
+    const session = await authenticate(arena)
+    await pressThrough(arena, session, 30)
+    const { body: banked } = await arena.door('/game/bank', { session, batch: batchId() })
+    await arena.player.claims.add(banked.bundle)
+
+    const { body: order } = await arena.door('/game/order', { session, sku: 'glove' })
+    expect(order.id).toBeString()
+
+    const open = await arena.door('/game/purchases', { session })
+    expect(open.status).toBe(200)
+    expect(open.body.purchases.at(-1)).toMatchObject({ id: order.id, state: 'open' })
+
+    const coins = await arena.player.token(arena.game.catalogue().coin.asset)
+    await coins.transfer(order.to, order.price)
+
+    let ended: any
+    for (let attempt = 0; attempt < 200 && ended?.state !== 'arrived'; attempt++) {
+      await Bun.sleep(25)
+      ended = (await arena.door('/game/purchases', { session })).body.purchases.at(-1)
+    }
+    expect(ended).toMatchObject({ id: order.id, state: 'arrived', item: 'Springy Glove' })
+  })
+
+  forEachDoor('asking without a session is refused rather than answered', async (arena) => {
+    const { status, body } = await arena.door('/game/purchases', { address: arena.player.address })
+    expect(status).toBe(400)
+    expect(body.purchases).toBeUndefined()
+    expect(body.error).toMatch(/Prove your address/)
+  })
+})
+
 describe('a caller cannot state its own reward', () => {
   forEachDoor('a bank without a session is refused', async (arena) => {
     // The exact request from issue #10's reproduction, at the exact URL.

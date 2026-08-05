@@ -18,6 +18,7 @@ import { Kei, type ClaimBundle, type IssuerToken, type Item } from 'kei-transact
 import type { KeiNode } from 'kei-transaction'
 
 import type { OwnershipChallengeMessage } from '../shared/ownership.js'
+import type { PurchaseRecord } from '../shared/purchases.js'
 import {
   COIN,
   COINS_PER_KEI,
@@ -78,8 +79,24 @@ export interface Game {
   /** Collect a kill this server recorded, by the event id the kill returned. */
   loot(session: unknown, origin: string, event: unknown): Promise<ClaimBundle>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
-  order(session: unknown, origin: string, sku: string): Promise<{ to: string; price: number; asset: string }>
+  order(session: unknown, origin: string, sku: string): Promise<Placed>
+  /**
+   * How this wallet's recent purchases ended.
+   *
+   * Answered to the proven address and to nobody else, because it is a list of
+   * what somebody bought and what they were refunded.
+   */
+  purchases(session: unknown, origin: string): PurchaseRecord[]
   close(): void
+}
+
+/** What `order()` hands back: where to pay, how much, and what to ask about later. */
+export interface Placed {
+  /** Names this purchase, so the client can ask how it ended. */
+  id: string
+  to: string
+  price: number
+  asset: string
 }
 
 /** What a slime is worth, in coins. */
@@ -96,6 +113,17 @@ const ORDER_TTL_MS = 120_000
 const BATCH_TTL_MS = 5 * 60_000
 /** Batches remembered. Past this the oldest is dropped and its retry refused. */
 const MAX_REMEMBERED_BATCHES = 4_096
+/**
+ * How long a finished purchase is still answerable.
+ *
+ * Long enough that a player who reloads mid-purchase, or comes back from a
+ * locked phone, still gets told how it ended; short enough that this is a
+ * noticeboard rather than a receipt book. What it is *not* is the record of a
+ * debt — see #21 for that, which needs storage that outlives this process.
+ */
+const PURCHASE_TTL_MS = 10 * 60_000
+/** Purchases remembered per wallet. The oldest goes first. */
+const PURCHASES_PER_WALLET = 8
 
 export async function startGame(options: GameOptions): Promise<Game> {
   const kei = await Kei.server({
@@ -241,6 +269,14 @@ export async function startGame(options: GameOptions): Promise<Game> {
       // wrong item.
       const { address } = sessions.require(session, origin)
       return shop.order(address, sku)
+    },
+
+    purchases(session, origin) {
+      // The same rule the order itself follows: the wallet is the proven one,
+      // never a body field. What somebody bought and what they were refunded is
+      // theirs to read and nobody else's.
+      const { address } = sessions.require(session, origin)
+      return shop.purchases(address)
     },
 
     close() {
@@ -429,6 +465,8 @@ function batchId(value: unknown): string {
 // ---------------------------------------------------------------------- shop
 
 interface Order {
+  /** The id `order()` gave the client, so an ending can be filed under it. */
+  id: string
   sku: string
   /** Raw coin units. See the decimals check in `openShop` for why not a number. */
   price: bigint
@@ -465,7 +503,11 @@ function openShop(
   kei: Kei,
   coins: IssuerToken,
   items: ReadonlyMap<string, Item>,
-): { order(address: string, sku: string): Promise<{ to: string; price: number; asset: string }>; close(): void } {
+): {
+  order(address: string, sku: string): Promise<Placed>
+  purchases(address: string): PurchaseRecord[]
+  close(): void
+} {
   // Whole coins are raw coins here: COIN has 0 decimals (shared/catalogue.ts),
   // so every figure below is both, and BigInt keeps it that way from the node's
   // raw decimal strings (SPEC §5.10) through to the comparison that decides
@@ -479,6 +521,45 @@ function openShop(
   }
 
   const orders = new Map<string, Order>()
+
+  /**
+   * How each wallet's recent purchases ended.
+   *
+   * The shop already reaches one of two endings for every arrival — the item, or
+   * the coins back (#11, PR #13). This is the other half of that: the player is
+   * on the far side of an anonymous transfer and, before this, had no way to be
+   * told which ending happened. A refund nobody can see is close enough to money
+   * that vanished, which undoes most of the value of getting the refund right.
+   *
+   * Newest last, per address, bounded both ways: the oldest entry goes once a
+   * wallet has `PURCHASES_PER_WALLET`, and everything older than
+   * `PURCHASE_TTL_MS` is swept on write. It is a noticeboard, not a ledger —
+   * balances are on the chain and obligations are #21's problem.
+   */
+  const purchases = new Map<string, PurchaseRecord[]>()
+
+  const sweepPurchases = (): void => {
+    const at = Date.now()
+    for (const [who, list] of purchases) {
+      const kept = list.filter((entry) => at - entry.at <= PURCHASE_TTL_MS)
+      if (kept.length === 0) purchases.delete(who)
+      else if (kept.length !== list.length) purchases.set(who, kept)
+    }
+  }
+
+  /** File an ending under the wallet it happened to, replacing that order's entry. */
+  const record = (address: string, entry: PurchaseRecord): void => {
+    sweepPurchases()
+    const list = purchases.get(address) ?? []
+    // An order moves through states rather than appearing once per state, so an
+    // entry that already names this id is updated in place. A payment with no
+    // order has no id and is always a new line.
+    const existing = entry.id === undefined ? -1 : list.findIndex((held) => held.id === entry.id)
+    if (existing >= 0) list[existing] = entry
+    else list.push(entry)
+    while (list.length > PURCHASES_PER_WALLET) list.shift()
+    purchases.set(address, list)
+  }
 
   /**
    * Copies nobody owns yet, read off the chain rather than counted here.
@@ -507,6 +588,36 @@ function openShop(
     console.warn(`[shop] returned ${amount} ${coins.symbol} to ${to}: ${because}.`)
   }
 
+  /** What an order is called on the chain, for a player to read. Never a hex id. */
+  const named = (order: Order): Pick<PurchaseRecord, 'id' | 'sku' | 'item'> => {
+    const name = upgradeBySku(order.sku)?.name
+    return { id: order.id, sku: order.sku, ...(name === undefined ? {} : { item: name }) }
+  }
+
+  /**
+   * Return coins, and write down that they went back.
+   *
+   * The transfer and the record are one operation from the player's side: a
+   * refund they cannot see is barely distinguishable from money that vanished,
+   * so the two cases this can end in — returned, or stuck — are both filed
+   * before this returns or throws.
+   */
+  const payBack = async (to: string, amount: bigint, because: string, order?: Order): Promise<void> => {
+    if (amount <= 0n) return
+    const about = order ? named(order) : {}
+    try {
+      await coins.transfer(to, amount.toString())
+    } catch (error) {
+      // Delivered nothing and returned nothing. #21 is what will make this
+      // recoverable; until then the least this can do is stop it being silent.
+      console.error(`[shop] ${to} is owed ${amount} ${coins.symbol} and the shop could not return it:`, error)
+      record(to, { ...about, state: 'stuck', coins: Number(amount), reason: because, at: Date.now() })
+      throw error
+    }
+    console.warn(`[shop] returned ${amount} ${coins.symbol} to ${to}: ${because}.`)
+    record(to, { ...about, state: 'returned', coins: Number(amount), reason: because, at: Date.now() })
+  }
+
   /**
    * Honour one settled payment, or give it back.
    *
@@ -522,20 +633,20 @@ function openShop(
     // Coins against no order: a payment for an order that already expired, one
     // sent by hand, or a second payment for an order being delivered. Keeping
     // them would be charging for nothing, so they go back.
-    if (!order) return refund(from, paid, 'the shop had no open order for it')
-    if (order.settling) return refund(from, paid, 'the order it was for is already being delivered')
+    if (!order) return payBack(from, paid, 'the shop had no open order for it')
+    if (order.settling) return payBack(from, paid, 'the order it was for is already being delivered')
 
     const upgrade = upgradeBySku(order.sku)
     const item = items.get(order.sku)
     // Orders only ever hold a sku `order()` accepted, so this cannot fire — but
     // returning the coins is the right answer even to a state that cannot happen.
-    if (!upgrade || !item) return refund(from, paid, 'the shop no longer sells that')
+    if (!upgrade || !item) return payBack(from, paid, 'the shop no longer sells that', order)
 
     if (paid < order.price) {
       // The order stays open, so the right payment still lands the item. The
       // short one goes back rather than sitting here as an unrecorded windfall,
       // which is what a bare `return` made of it.
-      return refund(from, paid, `${upgrade.name} costs ${order.price} coins and ${paid} arrived`)
+      return payBack(from, paid, `${upgrade.name} costs ${order.price} coins and ${paid} arrived`, order)
     }
 
     order.settling = true
@@ -547,11 +658,15 @@ function openShop(
       // owed their coins, and this is the only place that can pay them.
       console.error(`[shop] the ${upgrade.name} for ${from} did not mint:`, error)
       orders.delete(from)
-      return refund(from, paid, `the shop could not deliver the ${upgrade.name}`)
+      return payBack(from, paid, `the shop could not deliver the ${upgrade.name}`, order)
     }
 
     // Delivered, so the order is spent and the record can go.
     orders.delete(from)
+    // Written before the burn and the change, because the item is on the chain
+    // from here and that is the answer the player is waiting for. What follows
+    // is the shop tidying up after itself.
+    record(from, { ...named(order), state: 'arrived', at: Date.now() })
     // The shop is a sink: coins spent here stop existing, which frees the
     // headroom they took under the cap (SPEC §5.6.6). Only the price is burned;
     // anything above it was never the shop's.
@@ -566,8 +681,22 @@ function openShop(
     void settle(arrival.from, paid).catch((error) => {
       // Reached only when the coins could not be delivered *and* could not be
       // returned, which needs durable state to retry from and this demo has
-      // none. Loud, because it is the one case where a player is out of pocket.
+      // none (#21). Loud, because it is the one case where a player is out of
+      // pocket — and now also written down, so the player is told that rather
+      // than left watching an optimistic sentence that never resolves.
       console.error(`[shop] ${arrival.from} is owed ${paid} ${coins.symbol} and the shop could not settle it:`, error)
+      // `payBack` files a better-described `stuck` before it rethrows, and it is
+      // the newest entry when it does. This is for everything else that can
+      // throw in `settle` — the burn, the change, a mint that resolved oddly.
+      const list = purchases.get(arrival.from) ?? []
+      if (list[list.length - 1]?.state !== 'stuck') {
+        record(arrival.from, {
+          state: 'stuck',
+          coins: Number(paid),
+          reason: 'the shop could neither deliver it nor return the coins',
+          at: Date.now(),
+        })
+      }
     })
   })
 
@@ -616,9 +745,22 @@ function openShop(
       }
       if (unsold !== null && unsold - spokenFor <= 0n) throw new GameError(soldOut(upgrade, unsold))
 
-      orders.set(address, { sku, price, at: Date.now(), settling: false })
-      return { to: kei.address, price: upgrade.price, asset: coins.id }
+      const placed: Order = { id: crypto.randomUUID(), sku, price, at: Date.now(), settling: false }
+      orders.set(address, placed)
+      // Filed as `open` at once, so a player who reloads between paying and the
+      // arrival landing has something to come back to. Nothing here says the
+      // coins moved — the player has not signed the transfer yet.
+      record(address, { ...named(placed), state: 'open', at: placed.at })
+      return { id: placed.id, to: kei.address, price: upgrade.price, asset: coins.id }
     },
+
+    purchases(address) {
+      sweepPurchases()
+      // Copied, because this is handed to a route that serialises it and the
+      // list behind it is still being written to.
+      return (purchases.get(address) ?? []).map((entry) => ({ ...entry }))
+    },
+
     close: stop,
   }
 }

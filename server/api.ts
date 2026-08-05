@@ -83,6 +83,13 @@ export async function handleGameApi(game: Game, path: string, request: Request):
         return json(await game.order(session, origin, String(sku ?? '')))
       }
 
+      case '/game/purchases': {
+        // How the last few purchases ended. Read-only, and answered to the
+        // proven wallet only — it is a list of what somebody bought.
+        const { session } = await body<{ session: unknown }>(request)
+        return json({ purchases: game.purchases(session, origin) })
+      }
+
       default:
         return null
     }
