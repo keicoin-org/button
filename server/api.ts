@@ -66,8 +66,11 @@ export async function handleGameApi(game: Game, path: string, request: Request):
       }
 
       case '/game/bank': {
-        const { session } = await body<{ session: unknown }>(request)
-        return json({ bundle: await game.bank(session, origin) })
+        // `batch` is the client's name for this attempt, and the only field in
+        // the whole surface a caller invents. It buys nothing — it says which
+        // payout is being asked for, so asking twice cannot buy two.
+        const { session, batch } = await body<{ session: unknown; batch: unknown }>(request)
+        return json({ bundle: await game.bank(session, origin, batch) })
       }
 
       case '/game/loot': {

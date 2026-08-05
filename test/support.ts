@@ -6,7 +6,7 @@
  * past the boundary would make every test above it prove nothing.
  */
 
-import { Kei, MockNode, randomSeed } from 'kei-transaction'
+import { Kei, MockNode, randomSeed, type ClaimBundle } from 'kei-transaction'
 
 import { startGame, type Game } from '../server/game.js'
 import { sign } from '../src/ownership.js'
@@ -64,6 +64,20 @@ export async function open(game: Game, player: Kei, origin = ORIGIN): Promise<st
 /** Press `times` times, one observed request each, exactly as the client does. */
 export function press(game: Game, session: string, times: number, origin = ORIGIN): void {
   for (let index = 0; index < times; index++) game.press(session, origin)
+}
+
+let batches = 0
+/** A batch id, unique per call — one per attempt, exactly as the client makes them. */
+export const batchId = (): string => `batch-${++batches}`
+
+/**
+ * Bank as the client does: one named attempt.
+ *
+ * Pass a `batch` that has been used before to retry *that* attempt, which is
+ * what a client does when it never saw the answer to the first one.
+ */
+export function bank(game: Game, session: string, batch = batchId(), origin = ORIGIN): Promise<ClaimBundle> {
+  return game.bank(session, origin, batch)
 }
 
 /** A whole slime, hit until this server says it is dead. Returns the event id. */
