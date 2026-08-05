@@ -14,7 +14,7 @@
  * server watched them do.
  */
 
-import { Kei, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
+import { Kei, KEI_DECIMALS, issuanceBurn, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
 import type { KeiNode } from 'kei-transaction'
 
 import type { OwnershipChallengeMessage } from '../shared/ownership.js'
@@ -82,6 +82,38 @@ export interface Game {
   close(): void
 }
 
+/**
+ * Assets this game issues: the currency, and one item type per upgrade.
+ *
+ * Counted off `UPGRADES` rather than written down, because the bill below is
+ * priced from this number and a sixth upgrade must not leave it behind.
+ */
+const ISSUED_ASSETS = UPGRADES.length + 1
+
+/**
+ * What the next `assets` issuances burn, in whole Kei.
+ *
+ * SPEC §5.6.5: **the nth asset an account issues burns n Kei.** The first costs
+ * 1, the sixth costs 6, so this game's six cost 21 between them — not the flat
+ * 1,000 an asset that the grant here used to be sized against. That flat rule is
+ * the one §5.6.5 says it *replaced*; no published version ever charged it, and
+ * budgeting against it over-funds an issuer by two orders of magnitude and
+ * teaches a developer to provision 500,000 Kei for a catalogue that costs
+ * 125,751.
+ *
+ * The per-asset price comes from the SDK's own `issuanceBurn`, which is the same
+ * function the ledger prices the block with, so this cannot drift from what the
+ * chain will actually charge. `alreadyIssued` is the count the chain keeps for
+ * the account, because the price is per account and does not reset.
+ */
+export function issuanceCost(alreadyIssued: number, assets: number): number {
+  let raw = 0n
+  for (let nth = 0; nth < assets; nth++) raw += issuanceBurn(alreadyIssued + nth)
+  // Divided as a BigInt and only then made a number: every issuance burn is a
+  // whole number of Kei, and 10^18 raw units do not survive a float.
+  return Number(raw / 10n ** BigInt(KEI_DECIMALS))
+}
+
 /** What a slime is worth, in coins. */
 const MOB_DROP = 25
 /** An order nobody paid for is forgotten after this long. */
@@ -104,11 +136,20 @@ export async function startGame(options: GameOptions): Promise<Game> {
     ...(options.network === undefined ? {} : { network: options.network }),
   })
 
-  // Issuance burns 1,000 Kei per asset (SPEC §5.6.5), and this game issues one
-  // currency and five upgrades. On a real network somebody funds this address
-  // once; on a mock the faucet does.
-  const needed = (UPGRADES.length + 1) * 1_000 + 100
-  if ((await kei.balance()) < needed) await kei.faucet(needed)
+  // Issuing is the one thing in Kei that is not free (SPEC §5.6.5), and this
+  // game issues one currency and one item type per upgrade. On a real network
+  // somebody funds this address once; on a mock the faucet does.
+  //
+  // How many it has issued already is on the chain, so it is read rather than
+  // assumed to be zero: an issuer that has issued before is being funded for its
+  // *next* six assets, which cost more than a fresh account's first six.
+  const account = await kei.client.node.accountInfo(kei.address)
+  const needed = issuanceCost(account?.issuedCount ?? 0, ISSUED_ASSETS)
+  const held = await kei.balance()
+  // The shortfall exactly. Nothing else here costs Kei — transfers, mints,
+  // claims and burns are free forever — so a margin on top would be a figure
+  // with no rule behind it, which is what the last one turned out to be.
+  if (held < needed) await kei.faucet(needed - held)
 
   const coins = await kei.token.issue({
     name: COIN.name,

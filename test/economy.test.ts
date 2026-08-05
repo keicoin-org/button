@@ -11,10 +11,10 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
+import { KEI_DECIMALS, Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
 
-import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
-import { startGame } from '../server/game.js'
+import { COIN, COINS_PER_KEI, UPGRADES, payoutFor, upgradeBySku } from '../shared/catalogue.js'
+import { issuanceCost, startGame } from '../server/game.js'
 import { ORIGIN, bank, batchId, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
@@ -460,6 +460,62 @@ describe('the exchange desk', () => {
     press(game, session, 9)
     await player.claims.add(await bank(game, session))
     expect(await coins.balance()).toBe(9)
+  }, 30_000)
+})
+
+/**
+ * What it costs this game to exist.
+ *
+ * Issuing is the one thing in Kei that is not free (SPEC §5.6.5), and the rule
+ * is *the nth asset an account issues burns n Kei* — not the flat 1,000 the
+ * grant here used to be sized against, which is the rule §5.6.5 replaced. So
+ * the first test measures the burn against the chain rather than restating a
+ * number, and the second says the grant is that measurement and not a literal
+ * that can drift away from it.
+ */
+describe('funding the issuer', () => {
+  test('issuing what this game issues burns 1+2+…+6 Kei, measured on the chain', async () => {
+    const node = await MockNode.create()
+    const issuer = await Kei.server({ seed: randomSeed(), node, network: 'mock' })
+    running.push({ close: () => issuer.close() })
+
+    // Funded well past any of it, so what is measured is the burn and not a
+    // refusal part-way through.
+    await issuer.faucet(1_000)
+    const before = await issuer.balance()
+
+    await issuer.token.issue({ ...COIN, transfer: 'open', swap: 'one-way', rate: COINS_PER_KEI })
+    for (const upgrade of UPGRADES) {
+      await issuer.items.create({
+        name: upgrade.name,
+        description: upgrade.description,
+        supply: upgrade.supply,
+        transfer: 'open',
+      })
+    }
+
+    // Six assets: 1 + 2 + 3 + 4 + 5 + 6. Against the flat 1,000 this used to be
+    // budgeted at, the difference is 21 Kei versus 6,000.
+    expect(before - (await issuer.balance())).toBe(21)
+    expect(issuanceCost(0, UPGRADES.length + 1)).toBe(21)
+
+    // The price is per account and does not reset, so the *next* six cost more.
+    expect(issuanceCost(UPGRADES.length + 1, UPGRADES.length + 1)).toBe(57)
+  }, 30_000)
+
+  test('the grant covers the issuances and leaves nothing spare', async () => {
+    const { game, node } = await table()
+
+    // `startGame` faucets what it is about to burn and then burns it, so an
+    // issuer that has finished starting holds nothing. A grant sized against the
+    // flat rule would have left 6,079 Kei sitting here — harmless in itself, but
+    // it is the figure a reader copies, and it makes starting up depend on a
+    // rate-limited faucet handing over two orders of magnitude more than needed.
+    const account = await node.accountInfo(game.address)
+    expect(Number(BigInt(account!.balance) / 10n ** BigInt(KEI_DECIMALS))).toBe(0)
+
+    // And it did start: six assets on the chain, priced by the rule above.
+    expect(account!.issuedCount).toBe(UPGRADES.length + 1)
   }, 30_000)
 })
 
