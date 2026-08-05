@@ -170,7 +170,8 @@ export async function signOwnershipChallenge(
  * cannot burn the nonce an honest client is still holding.
  */
 export async function verifyOwnershipProof(proof: unknown, expected: OwnershipExpectation): Promise<boolean> {
-  const wanted = ownershipChallengeHash(parseOwnershipChallenge(expected))
+  const { nonces, ...asked } = expected
+  const wanted = ownershipChallengeHash(parseOwnershipChallenge(asked))
 
   let candidate: OwnershipProof
   try {

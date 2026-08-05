@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Kei, randomSeed } from 'kei-transaction'
 import { startGame, type Game } from '../server/game.js'
+import { ORIGIN, kill, open as openSession, press } from './support.js'
 
 const nodeUrl = process.env.KEI_NODE_URL
 const running: Array<{ close(): void }> = []
@@ -29,8 +30,9 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
     const player = await Kei.start({ seed: randomSeed(), node: nodeUrl!, network: 'testnet' })
     running.push(game, player)
 
-    // A real rooted claim from a defeated mob.
-    await player.claims.add(await game.loot(player.address, 'slime-1'))
+    // A real rooted claim from a mob this server watched die.
+    const session = await openSession(game, player)
+    await player.claims.add(await game.loot(session, ORIGIN, kill(game, session, 'slime-1')))
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     expect(await coins.balance()).toBe(25)
@@ -38,8 +40,9 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
     // Earn the remainder, pay the NPC, and ask the native holders index who owns it.
     const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
     expect(await (await player.token(cap.asset)).info()).toMatchObject({ maxSupply: '1' })
-    await player.claims.add(await game.bank(player.address, cap.price))
-    const order = await game.order(player.address, cap.sku)
+    press(game, session, cap.price)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    const order = await game.order(session, ORIGIN, cap.sku)
     await coins.transfer(order.to, order.price)
     await until(async () => (await player.items.owner(cap.asset)) === player.address, 'native item delivery')
     expect(await player.items.owner(cap.asset)).toBe(player.address)
