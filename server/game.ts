@@ -7,11 +7,17 @@
  * server is actually for: deciding what a press is worth and what things cost.
  *
  * It holds the game's seed, which is why it cannot run in a browser (SPEC §6.3).
+ *
+ * Every rewarding method here takes a **session id**, never an address and never
+ * a count. `server/sessions.ts` is what turns one into the other, and it is the
+ * only thing in this repository that decides who a caller is or what this
+ * server watched them do.
  */
 
 import { Kei, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
 import type { KeiNode } from 'kei-transaction'
 
+import type { OwnershipChallengeMessage } from '../shared/ownership.js'
 import {
   COIN,
   COINS_PER_KEI,
@@ -21,6 +27,14 @@ import {
   upgradeBySku,
   type CataloguePayload,
 } from '../shared/catalogue.js'
+import { GameError } from './errors.js'
+import {
+  DEFAULT_OBSERVATION_RATE,
+  createSessions,
+  type HitReceipt,
+  type PressReceipt,
+  type Session,
+} from './sessions.js'
 
 export interface GameOptions {
   seed: string
@@ -30,24 +44,40 @@ export interface GameOptions {
   exchange?: boolean
   /** How long banked presses wait to be batched with everybody else's. */
   flushMs?: number
-  /** Presses a second above which a bank is not a human hand. */
+  /** Presses a second above which this server stops watching (SPEC §8, and #10). */
   pressRateCap?: number
+  /** The largest burst a rested address may spend. Defaults to two seconds' worth. */
+  pressBurst?: number
+  /** Names this running instance inside the challenge. Defaults to the issuer address. */
+  room?: string
+  /** Test seam for the observation ceiling's clock. */
+  now?: () => number
 }
 
 export interface Game {
   address: string
+  /** Which instance this is. Signed into every challenge, so proofs do not travel. */
+  room: string
   catalogue(): CataloguePayload
-  /** Pay for presses. Returns the proof the player claims with (SPEC §5.5). */
-  bank(address: string, presses: number): Promise<ClaimBundle>
-  /** Defeat a world mob once; its coin drop is a rooted claim, not server state. */
-  loot(address: string, mob: string): Promise<ClaimBundle>
+  /** What a wallet signs to bind a session to its address. One use, and it expires. */
+  challenge(address: string, origin: string): OwnershipChallengeMessage
+  /** Redeem a signed challenge. Everything below needs the id this returns. */
+  authenticate(proof: unknown, origin: string): Promise<Session>
+  /** One press, counted here because this request arrived — never a caller's figure. */
+  press(session: unknown, origin: string): PressReceipt
+  /** One hit on a mob. This server decides when it died, and names the event. */
+  hit(session: unknown, origin: string, mob: unknown): HitReceipt
+  /** Pay for the presses this server observed. Returns the proof to claim with (§5.5). */
+  bank(session: unknown, origin: string): Promise<ClaimBundle>
+  /** Collect a kill this server recorded, by the event id the kill returned. */
+  loot(session: unknown, origin: string, event: unknown): Promise<ClaimBundle>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
-  order(address: string, sku: string): Promise<{ to: string; price: number; asset: string }>
+  order(session: unknown, origin: string, sku: string): Promise<{ to: string; price: number; asset: string }>
   close(): void
 }
 
-/** Fast for a finger, slow for a script. */
-const DEFAULT_PRESS_RATE_CAP = 25
+/** What a slime is worth, in coins. */
+const MOB_DROP = 25
 /** An order nobody paid for is forgotten after this long. */
 const ORDER_TTL_MS = 120_000
 
@@ -96,12 +126,20 @@ export async function startGame(options: GameOptions): Promise<Game> {
 
   const shop = openShop(kei, coins, items)
   const drops = new DropBatch(coins, options.flushMs ?? 1_500)
-  const lastBank = new Map<string, number>()
-  const rateCap = options.pressRateCap ?? DEFAULT_PRESS_RATE_CAP
-  const lootClaims = new Map<string, Promise<ClaimBundle>>()
+
+  // The issuer address by default, so a restarted issuer is a different room and
+  // the proofs made against the old one stop authenticating anywhere.
+  const room = options.room ?? kei.address
+  const sessions = createSessions({
+    room,
+    refillPerSecond: options.pressRateCap ?? DEFAULT_OBSERVATION_RATE,
+    ...(options.pressBurst === undefined ? {} : { capacity: options.pressBurst }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  })
 
   return {
     address: kei.address,
+    room,
 
     catalogue() {
       return {
@@ -113,38 +151,57 @@ export async function startGame(options: GameOptions): Promise<Game> {
       }
     },
 
-    async bank(address, presses) {
-      const now = Date.now()
-      const since = now - (lastBank.get(address) ?? now - 1_000)
-      lastBank.set(address, now)
-
-      // The client counts the presses, because in single-player nothing else
-      // sees them. That is a real trust hole and this is not a fix for it — it
-      // is a ceiling, so the hole is worth a few coins rather than the supply.
-      // M8 puts Colyseus in the room and the presses become observed.
-      const allowed = Math.max(1, Math.ceil((since / 1_000) * rateCap) + rateCap)
-      const counted = Math.min(Math.floor(presses), allowed)
-      if (!(counted > 0)) throw new GameError('That was zero presses.')
-
-      const { perPress } = payoutFor(await ownedBy(kei, address, items))
-      return drops.add(address, counted * perPress)
+    challenge(address, origin) {
+      return sessions.challenge(address, origin)
     },
 
-    loot(address, mob) {
-      if (!/^slime-[1-3]$/.test(mob)) throw new GameError('That mob does not exist.')
-      const key = `${address}:${mob}`
-      const existing = lootClaims.get(key)
-      if (existing) return existing
-      // Store the promise before waiting so double clicks cannot publish two leaves.
-      const claim = drops.add(address, 25).catch((error) => {
-        lootClaims.delete(key)
+    authenticate(proof, origin) {
+      return sessions.authenticate(proof, origin)
+    },
+
+    press(session, origin) {
+      return sessions.press(session, origin)
+    },
+
+    hit(session, origin, mob) {
+      return sessions.hit(session, origin, mob)
+    },
+
+    async bank(session, origin) {
+      // Taken synchronously, before the first `await`: two banks in flight
+      // divide the tally rather than both selling it. The count is this
+      // server's, and there is no argument here a caller could put a figure in.
+      const { session: who, presses } = sessions.take(session, origin)
+
+      try {
+        const { perPress } = payoutFor(await ownedBy(kei, who.address, items))
+        return await drops.add(who.address, presses * perPress)
+      } catch (error) {
+        // Nothing was published, so the presses were never spent. They go back
+        // to the session that earned them and can be banked again.
+        sessions.restore(who.id, presses)
         throw error
-      })
-      lootClaims.set(key, claim)
-      return claim
+      }
     },
 
-    order(address, sku) {
+    async loot(session, origin, event) {
+      // The event is one this server minted when it watched the mob die. The
+      // caller names which kill, never which mob and never what it was worth.
+      const { session: who, mob } = sessions.redeem(session, origin, event)
+      try {
+        return await drops.add(who.address, MOB_DROP)
+      } catch (error) {
+        sessions.unredeem(String(event), { session: who.id, address: who.address, mob })
+        throw error
+      }
+    },
+
+    order(session, origin, sku) {
+      // The payer is the proven wallet, not a body field: an order names the
+      // address whose incoming transfer will be matched to it, and letting a
+      // caller name somebody else's is how a victim's payment delivers the
+      // wrong item.
+      const { address } = sessions.require(session, origin)
       return shop.order(address, sku)
     },
 
@@ -157,7 +214,7 @@ export async function startGame(options: GameOptions): Promise<Game> {
   }
 }
 
-export class GameError extends Error {}
+export { GameError } from './errors.js'
 
 // --------------------------------------------------------------------- drops
 

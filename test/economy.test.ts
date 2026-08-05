@@ -11,10 +11,10 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Kei, MockNode, randomSeed } from 'kei-transaction'
+import type { ClaimBundle } from 'kei-transaction'
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
-import { startGame, type Game } from '../server/game.js'
+import { ORIGIN, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
 
@@ -22,42 +22,26 @@ afterEach(() => {
   for (const closeable of running.splice(0)) closeable.close()
 })
 
-async function table(options: { exchange?: boolean; pressRateCap?: number } = {}): Promise<{
-  game: Game
-  player: Kei
-  node: MockNode
-}> {
-  const node = await MockNode.create()
-  const game = await startGame({
-    seed: randomSeed(),
-    node,
-    network: 'mock',
-    flushMs: 20,
-    // A test that wants 400 coins should not have to spend sixteen seconds
-    // earning them at a human rate. One test below uses the real ceiling.
-    pressRateCap: options.pressRateCap ?? 100_000,
-    ...(options.exchange === undefined ? {} : { exchange: options.exchange }),
-  })
-  const player = await Kei.start({ node, seed: randomSeed() })
-  running.push(game, player)
-  return { game, player, node }
-}
-
-/** Poll until true. Delivery is asynchronous by design — nothing here blocks a game loop. */
-async function until(condition: () => Promise<boolean>, what: string): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    if (await condition()) return
-    await Bun.sleep(25)
-  }
-  throw new Error(`Timed out waiting for ${what}.`)
+/**
+ * A game, a player, and a session that player proved.
+ *
+ * Every test below goes through the same door the browser does. Nothing here
+ * can hand the game an address or a press count, because the game no longer has
+ * a way to be handed one.
+ */
+async function table(options: { exchange?: boolean; pressRateCap?: number } = {}) {
+  const built = await freshTable(options)
+  running.push(built)
+  return { ...built, session: await open(built.game, built.player) }
 }
 
 describe('pressing', () => {
   test('banked presses become coins the player claims for themselves', async () => {
-    const { game, player } = await table()
+    const { game, player, session } = await table()
     const coins = await player.token(game.catalogue().coin.asset)
 
-    const bundle = await game.bank(player.address, 12)
+    press(game, session, 12)
+    const bundle = await game.bank(session, ORIGIN)
     expect(bundle.root).toMatch(/^[0-9A-F]{64}$/)
 
     await player.claims.add(bundle)
@@ -66,14 +50,14 @@ describe('pressing', () => {
 
   test('one root covers every player who banked in the same window', async () => {
     const { game, node } = await table()
-    const players = await Promise.all([
-      Kei.start({ node, seed: randomSeed() }),
-      Kei.start({ node, seed: randomSeed() }),
-      Kei.start({ node, seed: randomSeed() }),
-    ])
+    const joined = await Promise.all([join(node), join(node), join(node)])
+    const players = joined.map((entry) => entry.player)
     running.push(...players)
 
-    const bundles = await Promise.all(players.map((player, index) => game.bank(player.address, (index + 1) * 5)))
+    const sessions = await Promise.all(players.map((player) => open(game, player)))
+    sessions.forEach((session, index) => press(game, session, (index + 1) * 5))
+
+    const bundles = await Promise.all(sessions.map((session) => game.bank(session, ORIGIN)))
     expect(new Set(bundles.map((bundle) => bundle.root)).size).toBe(1)
 
     await Promise.all(players.map((player, index) => player.claims.add(bundles[index]!)))
@@ -82,29 +66,25 @@ describe('pressing', () => {
     expect(await coins.balanceOf(players[2]!.address)).toBe(15)
   }, 20_000)
 
-  test('two banks inside one window are one leaf, not two', async () => {
-    const { game, player } = await table()
+  test('two banks in flight divide one tally instead of both selling it', async () => {
+    const { game, player, session } = await table()
     const coins = await player.token(game.catalogue().coin.asset)
 
-    const [first, second] = await Promise.all([game.bank(player.address, 4), game.bank(player.address, 6)])
-    expect(first.root).toBe(second.root)
-    expect(first.amount).toBe(second.amount)
+    press(game, session, 10)
+    // The tally is taken synchronously, so the first bank takes all ten and the
+    // second finds nothing left. A second leaf here would be the same presses
+    // paid for twice.
+    const [first, second] = await Promise.allSettled([game.bank(session, ORIGIN), game.bank(session, ORIGIN)])
+    expect(first.status).toBe('fulfilled')
+    expect(second.status).toBe('rejected')
 
-    await player.claims.add(first)
+    await player.claims.add((first as PromiseFulfilledResult<ClaimBundle>).value)
     expect(await coins.balance()).toBe(10)
   }, 20_000)
 
-  test('a client claiming a million presses gets a ceiling instead', async () => {
-    const { game, player } = await table({ pressRateCap: 25 })
-    const coins = await player.token(game.catalogue().coin.asset)
-
-    await player.claims.add(await game.bank(player.address, 1_000_000))
-    expect(await coins.balance()).toBeLessThan(200)
-  }, 20_000)
-
-  test('zero presses is a sentence, not a block', async () => {
-    const { game, player } = await table()
-    await expect(game.bank(player.address, 0)).rejects.toThrow('That was zero presses.')
+  test('banking before this server watched anything is a sentence, not a block', async () => {
+    const { game, session } = await table()
+    await expect(game.bank(session, ORIGIN)).rejects.toThrow('has not seen any presses from you yet')
   }, 20_000)
 })
 
@@ -116,15 +96,16 @@ describe('the shop', () => {
   }, 20_000)
 
   test('an upgrade is bought with a transfer and delivered as an item', async () => {
-    const { game, player } = await table()
+    const { game, player, session } = await table()
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
 
-    await player.claims.add(await game.bank(player.address, 400))
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
     expect(await coins.balance()).toBeGreaterThanOrEqual(glove.price)
 
-    const order = await game.order(player.address, 'glove')
+    const order = await game.order(session, ORIGIN, 'glove')
     expect(order.price).toBe(upgradeBySku('glove')!.price)
 
     await coins.transfer(order.to, order.price)
@@ -135,32 +116,35 @@ describe('the shop', () => {
   }, 30_000)
 
   test('an upgrade changes what the next press is worth, read off the chain', async () => {
-    const { game, player } = await table()
+    const { game, player, session } = await table()
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     const knuckle = catalogue.upgrades.find((upgrade) => upgrade.sku === 'knuckle')!
 
-    await player.claims.add(await game.bank(player.address, 400))
-    const order = await game.order(player.address, 'knuckle')
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    const order = await game.order(session, ORIGIN, 'knuckle')
     await coins.transfer(order.to, order.price)
     await until(async () => (await player.items.owner(knuckle.asset)) === player.address, 'the knuckle to arrive')
 
     const before = await coins.balance()
-    await player.claims.add(await game.bank(player.address, 10))
+    press(game, session, 10)
+    await player.claims.add(await game.bank(session, ORIGIN))
     // +4 a press, and the server worked that out by reading the player's holdings.
     expect((await coins.balance()) - before).toBe(50)
   }, 30_000)
 
   test('coins spent in the shop are burned, not banked', async () => {
-    const { game, player } = await table()
+    const { game, player, session } = await table()
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
 
-    await player.claims.add(await game.bank(player.address, 400))
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
     const supplyBefore = Number((await coins.info()).circulating)
 
-    const order = await game.order(player.address, 'glove')
+    const order = await game.order(session, ORIGIN, 'glove')
     await coins.transfer(order.to, order.price)
     await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
     await until(async () => Number((await coins.info()).circulating) < supplyBefore, 'the coins to be burned')
@@ -169,35 +153,37 @@ describe('the shop', () => {
   }, 30_000)
 
   test('buying what you cannot afford says the price and the balance', async () => {
-    const { game, player } = await table()
-    await expect(game.order(player.address, 'cap')).rejects.toThrow(
+    const { game, session } = await table()
+    await expect(game.order(session, ORIGIN, 'cap')).rejects.toThrow(
       'Golden Button Cap costs 6000 coins and you have 0. Press the button a few more times.',
     )
   }, 20_000)
 
   test('the shop does not sell things it does not sell', async () => {
-    const { game, player } = await table()
-    await expect(game.order(player.address, 'a-second-house')).rejects.toThrow('does not sell "a-second-house"')
+    const { game, session } = await table()
+    await expect(game.order(session, ORIGIN, 'a-second-house')).rejects.toThrow('does not sell "a-second-house"')
   }, 20_000)
 })
 
 describe('mob loot', () => {
   test('a defeated mob drops a claim the player writes on their own chain', async () => {
-    const { game, player } = await table()
+    const { game, player, session } = await table()
     const coins = await player.token(game.catalogue().coin.asset)
-    const bundle = await game.loot(player.address, 'slime-1')
+    const bundle = await game.loot(session, ORIGIN, kill(game, session, 'slime-1'))
     expect(bundle.root).toMatch(/^[0-9A-F]{64}$/)
     await player.claims.add(bundle)
     expect(await coins.balance()).toBe(25)
   }, 20_000)
 
-  test('a retry returns the same entitlement instead of duplicating the drop', async () => {
-    const { game, player } = await table()
-    const [first, retry] = await Promise.all([
-      game.loot(player.address, 'slime-2'),
-      game.loot(player.address, 'slime-2'),
+  test('one kill pays once, however many times its event is presented', async () => {
+    const { game, session } = await table()
+    const event = kill(game, session, 'slime-2')
+    const [first, retry] = await Promise.allSettled([
+      game.loot(session, ORIGIN, event),
+      game.loot(session, ORIGIN, event),
     ])
-    expect(retry).toEqual(first)
+    expect(first.status).toBe('fulfilled')
+    expect(retry.status).toBe('rejected')
   }, 20_000)
 })
 
@@ -215,7 +201,7 @@ describe('the exchange desk', () => {
   }, 30_000)
 
   test('with the desk off, Kei buys nothing and the game still works', async () => {
-    const { game, player } = await table({ exchange: false })
+    const { game, player, session } = await table({ exchange: false })
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     expect(catalogue.exchange.open).toBe(false)
@@ -226,7 +212,8 @@ describe('the exchange desk', () => {
     expect(await coins.balance()).toBe(0)
 
     // The loop that matters is untouched: pressing still pays (SPEC §8).
-    await player.claims.add(await game.bank(player.address, 9))
+    press(game, session, 9)
+    await player.claims.add(await game.bank(session, ORIGIN))
     expect(await coins.balance()).toBe(9)
   }, 30_000)
 })

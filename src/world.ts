@@ -46,6 +46,8 @@ export interface World {
   onPress(handler: () => void): void
   onBuy(handler: (target: string) => void): void
   onMob(handler: (mob: string) => void): void
+  /** Take a mob out of the world. Called when the server says its drop was paid. */
+  defeat(mob: string): void
   update(state: EconomyState): void
   pop(text: string): void
   dispose(): void
@@ -227,7 +229,15 @@ export function createWorld(canvas: HTMLCanvasElement): World {
     }
     const mob = mobs.get(pick.pickedMesh)
     if (mob) {
-      pick.pickedMesh.setEnabled(false)
+      // Hit, not killed. The server counts the hits and decides which one was
+      // the last, so nothing is removed here — see `defeat`. The squash is the
+      // whole feedback a hit gets, and it has to be immediate: the round trip
+      // that scores it takes longer than a click feels.
+      const squashed = pick.pickedMesh
+      squashed.scaling.y = 0.4
+      setTimeout(() => {
+        squashed.scaling.y = 0.65
+      }, 90)
       for (const handler of mobHandlers) handler(mob)
       return
     }
@@ -300,6 +310,11 @@ export function createWorld(canvas: HTMLCanvasElement): World {
     },
     onMob(handler) {
       mobHandlers.push(handler)
+    },
+    defeat(mob) {
+      for (const [mesh, name] of mobs) {
+        if (name === mob) mesh.setEnabled(false)
+      }
     },
     update(state) {
       pending = state

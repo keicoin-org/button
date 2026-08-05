@@ -24,8 +24,14 @@ world.onBuy((target) => {
   else void economy.buy(target)
 })
 
+// A slime takes several hits, and only the server knows which one killed it —
+// so the mesh goes away when the drop lands rather than when the pointer lifts.
+// Clicking a slime the server refuses leaves it standing, which is the honest
+// picture: nothing was paid for it.
 world.onMob((mob) => {
-  void economy.loot(mob)
+  void economy.hit(mob).then((defeated) => {
+    if (defeated) world.defeat(mob)
+  })
 })
 
 economy.on((state) => world.update(state))

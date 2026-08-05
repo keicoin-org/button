@@ -1,11 +1,18 @@
 /**
  * Every line of Kei in the client, in one file, so it can be read in one sitting.
  *
- * The shape to notice: there is no `getBalance` call to this game's server, and
- * no session. The browser holds a key, signs its own blocks, and reads its own
- * balances from the node. The server is asked exactly two things — what a press
- * is worth, and what an upgrade costs — and both are its business rather than
- * the chain's.
+ * The shape to notice: there is no `getBalance` call to this game's server. The
+ * browser holds a key, signs its own blocks, and reads its own balances from the
+ * node. The server is asked exactly two things — what a press is worth, and what
+ * an upgrade costs — and both are its business rather than the chain's.
+ *
+ * There *is* a session, and what it is for is worth being precise about. The
+ * server has to know two things this file cannot be trusted to state: which
+ * wallet is asking, and how many presses actually happened. So this browser
+ * proves its address once by signing a challenge, and thereafter every press is
+ * a request the server counts for itself. The session authorises a payout. It
+ * never carries money, and the claim it leads to is still written by this
+ * wallet, from its own chain, exactly as before.
  *
  * The other thing to notice is what is missing. There is no save file. Upgrades
  * are items this wallet holds, so the progression is restored by reading the
@@ -14,6 +21,8 @@
  */
 
 import { Kei, type ClaimBundle, type PlayerToken, type WalletSummary } from 'kei-transaction'
+
+import type { OwnershipChallengeMessage } from '../shared/ownership.js'
 
 import {
   payoutFor,
@@ -35,6 +44,7 @@ import {
   type CoinLedger,
 } from './ledger.js'
 import { serialClaims } from './claim-queue.js'
+import { sign } from './ownership.js'
 
 export interface ShopRow extends Upgrade {
   asset: string
@@ -80,7 +90,8 @@ export interface Economy {
   readonly state: EconomyState
   press(times?: number): void
   buy(sku: string): Promise<void>
-  loot(mob: string): Promise<void>
+  /** Hit a mob once. True when the server said it died and paid the drop. */
+  hit(mob: string): Promise<boolean>
   topUp(kei: number): Promise<void>
   on(listener: (state: EconomyState) => void): void
   close(): void
@@ -98,6 +109,20 @@ const BANK_AFTER_MS = 3_000
  */
 const base = location.pathname.replace(/\/$/, '')
 const at = (path: string): string => `${base}${path}`
+
+/** POST JSON and read the answer, with the server's own sentence on a refusal. */
+async function post<T>(path: string, payload: unknown): Promise<T> {
+  const response = await fetch(at(path), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const body = (await response.json()) as T & { error?: string }
+  // SPEC §6.1: the server's refusals are sentences that state their own fix, so
+  // they are surfaced as written rather than replaced with a status code.
+  if (body.error) throw new Error(body.error)
+  return body
+}
 
 export async function connect(): Promise<Economy> {
   const listeners: Array<(state: EconomyState) => void> = []
@@ -194,6 +219,67 @@ export async function connect(): Promise<Economy> {
   kei.wallet.on('change', apply)
   kei.on('error', say)
 
+  // ------------------------------------------------------------------ session
+
+  /**
+   * Prove this address to the server, once, and hold the id it gives back.
+   *
+   * Every request that could pay this wallet carries that id and nothing else —
+   * no address, no press count, no mob name. What the id is worth is entirely
+   * what the server watched the session do, which is the whole point of it.
+   *
+   * The proof is one signature over a challenge the server issued, bound to this
+   * origin, this running issuer, and a nonce good for one use. It is not a
+   * bearer token for anything else: it authorises nothing on the chain, and this
+   * wallet still signs its own claims.
+   */
+  let session: string | null = null
+  let opening: Promise<string> | null = null
+
+  const openSession = (): Promise<string> => {
+    opening ??= (async () => {
+      const { challenge } = await post<{ challenge: OwnershipChallengeMessage }>('/game/session/challenge', {
+        address: kei.address,
+      })
+      const proof = await sign(kei, challenge)
+      const opened = await post<{ session: string }>('/game/session', { proof })
+      session = opened.session
+      return opened.session
+    })().finally(() => {
+      opening = null
+    })
+    return opening
+  }
+
+  /**
+   * Run something with a session, and re-prove once if the server says there is
+   * not one any more.
+   *
+   * A reconnect costs a signature and nothing else — in particular it does not
+   * reset the observation ceiling, which the server keys on the proven address
+   * rather than on the session, so dropping and re-proving is not a way to be
+   * watched harder.
+   */
+  const withSession = async <T>(run: (id: string) => Promise<T>): Promise<T> => {
+    const id = session ?? (await openSession())
+    try {
+      return await run(id)
+    } catch (error) {
+      if (!(error instanceof Error) || !/session/i.test(error.message) || session !== id) throw error
+      session = null
+      return run(await openSession())
+    }
+  }
+
+  try {
+    await openSession()
+  } catch (error) {
+    // The chain is reachable and the game server is not willing to watch this
+    // wallet. Presses still count on screen and still bank nothing, which is the
+    // same honest state practice mode is in.
+    say(error)
+  }
+
   // Banking and mob drops both enter the SDK's one shared held-bundle map.
   // Serialize at that common boundary so no two claimAll sweeps can read and
   // submit the same proof concurrently.
@@ -228,15 +314,15 @@ export async function connect(): Promise<Economy> {
     state.coins = bankingStarted(state.coins)
     changed()
 
+    await settled()
+
     let bundle: ClaimBundle
     try {
-      const response = await fetch(at('/game/bank'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ address: kei.address, presses }),
-      })
-      const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
-      if (body.error || !body.bundle) throw new Error(body.error ?? 'The game server sent no proof back.')
+      // No count goes out. The server pays for the presses it watched arrive,
+      // and this browser's own tally is a prediction of that figure rather than
+      // an instruction — which is why the reconciliation below exists.
+      const body = await withSession((id) => post<{ bundle?: ClaimBundle }>('/game/bank', { session: id }))
+      if (!body.bundle) throw new Error('The game server sent no proof back.')
       bundle = body.bundle
     } catch (error) {
       // Nothing was signed, so the presses are still owed. They go back to
@@ -248,9 +334,10 @@ export async function connect(): Promise<Economy> {
     }
 
     // What the chain will pay, rather than what the presses were hoped to be
-    // worth: the server caps a bank that arrived too fast to be a hand
-    // (server/game.ts's bank()), and the bundle carries the capped figure. The
-    // headline drops to it here, once, at the moment the truth arrives.
+    // worth. The two differ whenever a press did not reach the server or was
+    // refused by its observation ceiling, and the bundle carries the figure the
+    // server actually saw. The headline drops to it here, once, at the moment
+    // the truth arrives.
     const amount = paid(bundle)
     state.coins = banked(state.coins, expected, amount)
     state.message = null
@@ -311,12 +398,45 @@ export async function connect(): Promise<Economy> {
     }
   }
 
+  /**
+   * Tell the server a press happened — one request, one press.
+   *
+   * A press is worth coins, so the count has to be something the server saw
+   * rather than something this file asserts. One request each is the honest
+   * reading of "the server counted them" over HTTP, and it is what makes the
+   * batch below a *report of what landed* rather than an instruction.
+   *
+   * A refusal is not rolled back here. The optimistic coins added by `press()`
+   * are reconciled by the bank, which pays what the server observed; unwinding
+   * them twice would take the same coins off the headline twice.
+   */
+  const inFlightPresses = new Set<Promise<unknown>>()
+
+  const observe = (times: number): void => {
+    for (let index = 0; index < times; index++) {
+      const sent = withSession((id) => post('/game/press', { session: id })).catch(say)
+      inFlightPresses.add(sent)
+      void sent.finally(() => inFlightPresses.delete(sent))
+    }
+  }
+
+  /**
+   * Wait for every press already sent to have landed.
+   *
+   * Without this the twentieth press and the bank it triggers race each other,
+   * and a bank that overtakes its own presses is paid for fewer than happened.
+   * They are not lost — the server counts them for the next bank — but the
+   * headline would drop and then recover, which reads as the game losing coins.
+   */
+  const settled = (): Promise<unknown> => Promise.all([...inFlightPresses])
+
   const press = (times = 1): void => {
     // The headline moves on this line, before anything is awaited. That is the
     // whole requirement: the number answers the finger, and it answers it as a
     // count of presses rather than as a balance.
     state.unbankedPresses += times
     state.coins = pressed(state.coins, times * state.perPress)
+    observe(times)
     if (state.unbankedPresses >= BANK_AFTER_PRESSES) void bank()
     else timer ??= setTimeout(() => void bank(), BANK_AFTER_MS)
     changed()
@@ -350,15 +470,12 @@ export async function connect(): Promise<Economy> {
 
       try {
         state.message = null
-        const response = await fetch(at('/game/order'), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ address: kei.address, sku }),
-        })
-        const order = (await response.json()) as { to?: string; price?: number; error?: string }
-        if (order.error || !order.to || order.price === undefined) {
-          throw new Error(order.error ?? 'The shop did not answer.')
-        }
+        // The order is placed for the proven wallet, so the transfer the shop
+        // waits for is the one this browser is about to sign and no other.
+        const order = await withSession((id) =>
+          post<{ to?: string; price?: number }>('/game/order', { session: id, sku }),
+        )
+        if (!order.to || order.price === undefined) throw new Error('The shop did not answer.')
         // The player signs the payment. The shop signs the delivery. There is no
         // third arrangement in which one of them signs for the other.
         await coins.transfer(order.to, order.price)
@@ -369,15 +486,19 @@ export async function connect(): Promise<Economy> {
       }
     },
 
-    async loot(mob) {
+    async hit(mob) {
       try {
-        const response = await fetch(at('/game/loot'), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ address: kei.address, mob }),
-        })
-        const body = (await response.json()) as { bundle?: ClaimBundle; error?: string }
-        if (body.error || !body.bundle) throw new Error(body.error ?? 'The mob dropped no claim proof.')
+        // A slime takes several hits and the server counts them, so a drop is
+        // paid for a fight this server watched rather than for a claim that one
+        // happened. The kill comes back as an event id — the only thing
+        // `/game/loot` accepts, and good for one collection.
+        const blow = await withSession((id) => post<{ event?: string }>('/game/hit', { session: id, mob }))
+        if (!blow.event) return false
+
+        const body = await withSession((id) =>
+          post<{ bundle?: ClaimBundle }>('/game/loot', { session: id, event: blow.event }),
+        )
+        if (!body.bundle) throw new Error('The mob dropped no claim proof.')
 
         // A drop is owed exactly like a banked press is, so it goes through the
         // same stage. Registering it before claiming is what keeps the chain's
@@ -397,6 +518,7 @@ export async function connect(): Promise<Economy> {
       } catch (error) {
         say(error)
       }
+      return true
     },
 
     async topUp(amount) {
@@ -468,9 +590,11 @@ function offline(
     async buy() {
       /* nothing to buy without a shop */
     },
-    async loot() {
-		/* no chain, so there is no claimable drop */
-	},
+    async hit() {
+      // No server watched the fight, so there is nothing to be paid for. The
+      // slime stays where it is rather than vanishing for nothing.
+      return false
+    },
     async topUp() {
       /* nothing to pay without a chain */
     },
