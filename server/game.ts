@@ -291,8 +291,18 @@ function push<T>(map: Map<string, T[]>, key: string, value: T): void {
 
 interface Order {
   sku: string
-  price: number
+  /** Raw coin units. See the decimals check in `openShop` for why not a number. */
+  price: bigint
   at: number
+  /**
+   * A payment for this order is being honoured right now.
+   *
+   * It is what stops a second arrival from delivering the same order twice, and
+   * it is why the record outlives the payment: the order is the only thing that
+   * says what the coins were for, so deleting it before delivery is known to
+   * have worked destroys the one description of a debt the shop still owes.
+   */
+  settling: boolean
 }
 
 /**
@@ -303,28 +313,123 @@ interface Order {
  * A transfer carries no memo (decisions-m0 §4), so the intent is recorded here
  * first and matched to the arrival. The order is not the purchase: nothing is
  * delivered until the chain says the coins landed.
+ *
+ * Which leaves the shop holding one obligation it cannot argue its way out of.
+ * A player's transfer is signed by the player, settled by the chain, and final;
+ * the game does not hold their key and cannot reverse it. So once coins arrive
+ * there are exactly two honest endings — the item, or the coins back — and every
+ * branch in `settle` below reaches one of them. None of them keeps money and
+ * delivers nothing, which is what this file used to do to the second buyer of a
+ * supply-one item.
  */
 function openShop(
   kei: Kei,
   coins: IssuerToken,
   items: ReadonlyMap<string, Item>,
 ): { order(address: string, sku: string): Promise<{ to: string; price: number; asset: string }>; close(): void } {
+  // Whole coins are raw coins here: COIN has 0 decimals (shared/catalogue.ts),
+  // so every figure below is both, and BigInt keeps it that way from the node's
+  // raw decimal strings (SPEC §5.10) through to the comparison that decides
+  // whether a purchase happened. Checked rather than assumed, because the day
+  // the coin gains a decimal place these turn into float comparisons against raw
+  // strings, and a price that is off by one unit is a shop that steals.
+  if (coins.decimals !== 0) {
+    throw new Error(
+      `The shop compares coin amounts as whole units, and ${coins.symbol} has ${coins.decimals} decimals.`,
+    )
+  }
+
   const orders = new Map<string, Order>()
+
+  /**
+   * Copies nobody owns yet, read off the chain rather than counted here.
+   *
+   * `assetInfo` answers both halves in one call, in raw units, as decimal
+   * strings — which is the only form a billion-unit cap survives. Items are
+   * 0-decimal tokens (SPEC §7), so a raw unit is a copy. `null` is uncapped,
+   * and uncapped is never sold out.
+   */
+  const unsoldCopies = async (item: Item): Promise<bigint | null> => {
+    const info = await kei.client.node.assetInfo(item.id)
+    if (!info || info.maxSupply === null) return null
+    return BigInt(info.maxSupply) - BigInt(info.circulating)
+  }
+
+  /**
+   * Coins the shop is not entitled to, going back to the account that sent them.
+   *
+   * The shop can sign this and only this: it holds the coins, and it has never
+   * held the payer's key (SPEC §6.3). The amount crosses the SDK boundary as a
+   * decimal string, because a BigInt prints exactly and a float does not.
+   */
+  const refund = async (to: string, amount: bigint, because: string): Promise<void> => {
+    if (amount <= 0n) return
+    await coins.transfer(to, amount.toString())
+    console.warn(`[shop] returned ${amount} ${coins.symbol} to ${to}: ${because}.`)
+  }
+
+  /**
+   * Honour one settled payment, or give it back.
+   *
+   * Awaited by nothing — the arrival comes from a chain subscription, not from a
+   * request — so the `.catch` on the call below is the only thing between a
+   * failed mint and Node's default for an unhandled rejection, which is to take
+   * the whole game server down over one purchase. That is the same hazard, and
+   * the same fix, as world-of-wonder's `dropCTRL.ts`.
+   */
+  const settle = async (from: string, paid: bigint): Promise<void> => {
+    const order = orders.get(from)
+
+    // Coins against no order: a payment for an order that already expired, one
+    // sent by hand, or a second payment for an order being delivered. Keeping
+    // them would be charging for nothing, so they go back.
+    if (!order) return refund(from, paid, 'the shop had no open order for it')
+    if (order.settling) return refund(from, paid, 'the order it was for is already being delivered')
+
+    const upgrade = upgradeBySku(order.sku)
+    const item = items.get(order.sku)
+    // Orders only ever hold a sku `order()` accepted, so this cannot fire — but
+    // returning the coins is the right answer even to a state that cannot happen.
+    if (!upgrade || !item) return refund(from, paid, 'the shop no longer sells that')
+
+    if (paid < order.price) {
+      // The order stays open, so the right payment still lands the item. The
+      // short one goes back rather than sitting here as an unrecorded windfall,
+      // which is what a bare `return` made of it.
+      return refund(from, paid, `${upgrade.name} costs ${order.price} coins and ${paid} arrived`)
+    }
+
+    order.settling = true
+    try {
+      await kei.items.mint(item.id, from)
+    } catch (error) {
+      // Supply can run out between the order and the payment, and a mint is a
+      // chain round trip that can simply time out. Either way the player is
+      // owed their coins, and this is the only place that can pay them.
+      console.error(`[shop] the ${upgrade.name} for ${from} did not mint:`, error)
+      orders.delete(from)
+      return refund(from, paid, `the shop could not deliver the ${upgrade.name}`)
+    }
+
+    // Delivered, so the order is spent and the record can go.
+    orders.delete(from)
+    // The shop is a sink: coins spent here stop existing, which frees the
+    // headroom they took under the cap (SPEC §5.6.6). Only the price is burned;
+    // anything above it was never the shop's.
+    await coins.burn(order.price.toString())
+    await refund(from, paid - order.price, `it was more than the ${upgrade.name} costs`)
+  }
 
   const stop = kei.on('asset-received', (arrival) => {
     if (arrival.asset !== coins.id) return
-    const order = orders.get(arrival.from)
-    if (!order || arrival.amount < order.price) return
-    orders.delete(arrival.from)
-
-    void (async () => {
-      const item = items.get(order.sku)
-      if (!item) return
-      await kei.items.mint(item.id, arrival.from)
-      // The shop is a sink: coins spent here stop existing, which frees the
-      // headroom they took under the cap (SPEC §5.6.6).
-      await coins.burn(order.price)
-    })()
+    // 0 decimals, so the SDK's display number is already the raw unit count.
+    const paid = BigInt(arrival.amount)
+    void settle(arrival.from, paid).catch((error) => {
+      // Reached only when the coins could not be delivered *and* could not be
+      // returned, which needs durable state to retry from and this demo has
+      // none. Loud, because it is the one case where a player is out of pocket.
+      console.error(`[shop] ${arrival.from} is owed ${paid} ${coins.symbol} and the shop could not settle it:`, error)
+    })
   })
 
   return {
@@ -333,21 +438,68 @@ function openShop(
       const item = items.get(sku)
       if (!upgrade || !item) throw new GameError(`The shop does not sell "${sku}".`)
 
-      const held = await coins.balanceOf(address)
-      if (held < upgrade.price) {
+      const price = BigInt(upgrade.price)
+      const open = orders.get(address)
+      if (open?.settling) {
+        const pending = upgradeBySku(open.sku)?.name ?? open.sku
+        throw new GameError(`Your ${pending} is being delivered. Wait for it to land, then buy the next thing.`)
+      }
+
+      const [heldRaw, unsold] = await Promise.all([
+        // Raw, from the node, rather than `balanceOf`'s number: this comparison
+        // decides whether a player is told to go and spend 6,000 coins.
+        kei.client.node.holderBalance(coins.id, address),
+        unsoldCopies(item),
+      ])
+      const held = BigInt(heldRaw)
+      if (held < price) {
         throw new GameError(
           `${upgrade.name} costs ${upgrade.price} coins and you have ${held}. Press the button a few more times.`,
         )
       }
 
+      // Nothing is awaited from here to `orders.set`, which is what makes the
+      // supply check and the reservation one step rather than two. Two steps is
+      // the whole bug: read "one left", let a second caller read "one left", and
+      // both are told to pay. There is one instance of this map and one thread
+      // touching it — the Worker routes every request to one Durable Object
+      // (worker/index.ts, `idFromName('button')`) — so a synchronous block is
+      // genuinely indivisible here. It is still not the only defence, because it
+      // cannot be: supply is on the chain and the chain has other writers, which
+      // is what `settle`'s refund is for.
       for (const [who, order] of orders) {
-        if (Date.now() - order.at > ORDER_TTL_MS) orders.delete(who)
+        if (!order.settling && Date.now() - order.at > ORDER_TTL_MS) orders.delete(who)
       }
-      orders.set(address, { sku, price: upgrade.price, at: Date.now() })
+      let spokenFor = 0n
+      for (const [who, order] of orders) {
+        // This address's own order is about to be replaced, so it frees its copy.
+        if (who !== address && order.sku === sku) spokenFor += 1n
+      }
+      if (unsold !== null && unsold - spokenFor <= 0n) throw new GameError(soldOut(upgrade, unsold))
+
+      orders.set(address, { sku, price, at: Date.now(), settling: false })
       return { to: kei.address, price: upgrade.price, asset: coins.id }
     },
     close: stop,
   }
+}
+
+/**
+ * The refusal a player reads instead of paying for something that cannot arrive.
+ *
+ * It has to say two things to be worth reading: that no coins moved, and whether
+ * waiting would help. A copy held by an unfinished order comes back; one held by
+ * another player's wallet does not.
+ */
+function soldOut(upgrade: { name: string; supply: number }, unsold: bigint): string {
+  if (unsold > 0n) {
+    return `Somebody is paying for the last ${upgrade.name} right now. Try again in a minute — nothing was charged.`
+  }
+  const only =
+    upgrade.supply === 1
+      ? 'There is only one on this network and it is owned.'
+      : `All ${upgrade.supply} have been bought.`
+  return `The ${upgrade.name} is sold out. ${only} Nothing was charged.`
 }
 
 /** What this player owns, by sku — read from the chain, because that is where it is. */
