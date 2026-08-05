@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { keyPairFromSeed, randomSeed, signHash, type KeyPair } from '@keicoin/core'
 
+import { payoutFor } from '../shared/catalogue.js'
 import { ownershipChallengeHash, signOwnershipChallenge } from '../shared/ownership.js'
 import {
   DEFAULT_OBSERVATION_RATE,
@@ -316,6 +317,132 @@ describe('the observation ceiling', () => {
       DEFAULT_OBSERVATION_RATE * OBSERVATION_BURST_SECONDS,
     )
   }, 20_000)
+})
+
+/**
+ * The half of the bound that is not a constant.
+ *
+ * A flat ceiling at a finger's rate is not conservative, it is wrong: machines on
+ * the chain press faster than a hand, they were bought with coins, and refusing
+ * what they produce takes earnings off the one player who paid for the upgrade
+ * that produces them. Nine Auto-Pressers Mk II are 27 a second against a finger's
+ * 25, so the flat cap starts clipping at a reachable 13,500 coins.
+ */
+describe('machines press faster than a hand, and legitimately', () => {
+  test('nine Mk IIs are 27 presses a second, which is more than a finger is allowed', () => {
+    // The number the ceiling has to survive, read from the catalogue rather than
+    // asserted as a constant — if the upgrade changes, this test changes with it.
+    expect(payoutFor({ 'auto-mk2': 9 }).pressesPerSecond).toBe(27)
+    expect(payoutFor({ 'auto-mk2': 9 }).pressesPerSecond).toBeGreaterThan(DEFAULT_OBSERVATION_RATE)
+  })
+
+  test('a machine owner sustains what the machines produce, second after second', async () => {
+    let clock = 1_000_000
+    const sessions = bare({ now: () => clock, refillPerSecond: 25 })
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    const id = await prove(sessions, keys)
+    sessions.machines(keys.address, payoutFor({ 'auto-mk2': 9 }).pressesPerSecond)
+
+    // Ten seconds of an auto-presser doing exactly what it was sold as doing: 52
+    // a second, a finger's 25 plus the machines' 27. A rate that is sustainable
+    // is sustained — the bucket refills as fast as this spends it, indefinitely.
+    let refused = 0
+    for (let second = 0; second < 10; second++) {
+      clock += 1_000
+      for (let press = 0; press < 52; press++) {
+        try {
+          sessions.press(id, ORIGIN)
+        } catch {
+          refused += 1
+        }
+      }
+    }
+    // A flat 25 refuses 27 of every 52 once the burst is gone. That is 250-odd
+    // presses taken off a player who bought the machines that made them, and it
+    // is the regression this term exists to stop.
+    expect(refused).toBe(0)
+
+    // Still a ceiling, though: twice what the machines produce does get refused.
+    clock += 1_000
+    let allowed = 0
+    for (let press = 0; press < 200; press++) {
+      try {
+        sessions.press(id, ORIGIN)
+        allowed += 1
+      } catch {
+        break
+      }
+    }
+    expect(allowed).toBeLessThanOrEqual(104)
+  }, 20_000)
+
+  test('the raised rate raises the burst, so idle headroom is still two seconds', async () => {
+    let clock = 1_000_000
+    const sessions = bare({ now: () => clock, refillPerSecond: 25 })
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    sessions.machines(keys.address, 27)
+
+    // Two seconds of headroom at 52 a second, not at 25 — otherwise a machine
+    // owner coming back from idle is clipped for owning machines.
+    expect(drain(sessions, await prove(sessions, keys))).toBe(52 * OBSERVATION_BURST_SECONDS)
+  }, 20_000)
+
+  test('a swept bucket forgets the raised rate, leaving the rate a hand is allowed', async () => {
+    let clock = 1_000_000
+    const sessions = bare({ now: () => clock, refillPerSecond: 25 })
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    sessions.machines(keys.address, 27)
+
+    // An hour idle: the bucket has refilled to full, so the sweep drops it, and
+    // dropping it drops the rate with it. That is deliberate and it is safe — the
+    // fallback is a finger's burst, not zero, and the next `bank()` restores the
+    // machine rate. A client banks every twenty presses or three seconds, so a
+    // returning machine owner is inside this 50 long before it runs out.
+    clock += 3_600_000
+    expect(drain(sessions, await prove(sessions, keys))).toBe(50)
+  }, 20_000)
+
+  test('telling the server about machines does not refill a spent bucket', async () => {
+    let clock = 1_000_000
+    const sessions = bare({ now: () => clock, refillPerSecond: 25 })
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    const id = await prove(sessions, keys)
+
+    // Spend it all, then declare the machines. The ceiling moves; the tokens
+    // already spent stay spent, or a purchase would be a way to buy back presses
+    // that were already refused.
+    expect(drain(sessions, id)).toBe(50)
+    sessions.machines(keys.address, 27)
+    expect(() => sessions.press(id, ORIGIN)).toThrow()
+
+    // It refills at the new rate from here, which is the point of declaring it.
+    clock += 1_000
+    let observed = 0
+    for (let press = 0; press < 60; press++) {
+      try {
+        sessions.press(id, ORIGIN)
+        observed += 1
+      } catch {
+        break
+      }
+    }
+    expect(observed).toBe(52)
+  }, 20_000)
+
+  test('a rate is never taken from a request, only from the chain', async () => {
+    const { game, player, session } = await boardWithSession({ pressRateCap: 5, pressBurst: 10 })
+    const coins = await player.token(game.catalogue().coin.asset)
+
+    // A player who owns nothing gets a finger's rate however much they press, and
+    // there is no argument anywhere on the wire that says otherwise: `machines()`
+    // is fed by `bank()` from `payoutFor(ownedBy(...))` and by nothing else.
+    press(game, session, 10)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    expect(await coins.balance()).toBe(10)
+    expect(() => {
+      for (let index = 0; index < 200; index++) game.press(session, ORIGIN)
+    }).toThrow('faster than 5 presses a second')
+  }, 30_000)
 })
 
 describe('the payout is what was observed', () => {

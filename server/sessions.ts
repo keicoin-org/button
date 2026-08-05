@@ -55,6 +55,13 @@ export const HITS_PER_MOB = 3
  *
  * It is keyed by **address**, not by session, so a new session, a reconnect, or
  * twenty sockets at once all draw down the same bucket.
+ *
+ * `refillPerSecond` is the rate for a **finger**, and it is not the whole rate.
+ * An address whose on-chain machines press for it presses legitimately faster
+ * than any hand, and the ceiling adds that on top (`machines()` below): nine
+ * Auto-Pressers Mk II are 27 presses a second, bought and paid for, and a flat
+ * 25 would refuse two of them every second and take the earnings off exactly the
+ * player who bought the upgrade that produces them.
  */
 export interface CeilingOptions {
   /** Observations restored per second. */
@@ -130,6 +137,16 @@ interface LootEvent {
 interface Bucket {
   tokens: number
   at: number
+  /**
+   * Presses a second this address earns, a finger's rate plus its machines'.
+   *
+   * Held here rather than passed in, because `press()` is synchronous and what an
+   * address owns is on the chain — so the rate is refreshed at `bank()`, which is
+   * already reading those holdings to price the presses. That makes it at worst
+   * one bank stale after a purchase, and a bank is every twenty presses or three
+   * seconds (`src/economy.ts`); the burst covers the gap.
+   */
+  rate: number
 }
 
 export interface SessionRegistry {
@@ -147,6 +164,13 @@ export interface SessionRegistry {
   take(id: unknown, origin: string): { session: Session; presses: number }
   /** Put back exactly what `take` removed, when the payout never happened. */
   restore(id: string, presses: number): void
+  /**
+   * Tell the ceiling how fast this address's on-chain machines press.
+   *
+   * Read off the chain by the caller, never out of a request. Raises the rate and
+   * the burst; it never adds a token, so it cannot be used to refill.
+   */
+  machines(address: string, pressesPerSecond: number): void
   /** Redeem a kill this server recorded. One use; the mob id is never the caller's. */
   redeem(id: unknown, origin: string, event: unknown): { session: Session; mob: string }
   /** Undo `redeem` when the payout failed, so an honest kill is not eaten. */
@@ -199,32 +223,68 @@ export function createSessions(options: SessionOptions): SessionRegistry {
       // Only a *full* bucket is forgettable, and forgetting one is not a reset:
       // a bucket that is recreated starts full, which is the state it was in.
       // A partly spent bucket is the record of a spend and is never dropped.
-      if (bucket.tokens >= capacity && at - bucket.at > sessionTtl) buckets.delete(address)
+      // Compared against this bucket's own room, so a machine owner's fuller
+      // bucket is still recognised as full and still forgettable. Forgetting it
+      // drops the raised rate too, and the next `bank()` puts it back — which is
+      // inside the first burst, because banking is what a pressing client does.
+      if (bucket.tokens >= roomFor(bucket.rate) && at - bucket.at > sessionTtl) buckets.delete(address)
     }
     for (const [id, event] of events) {
       if (at - event.at > sessionTtl) events.delete(id)
     }
   }
 
+  /**
+   * The burst an address at `rate` may hold.
+   *
+   * Proportional to the rate, so it stays the same *number of seconds* of
+   * headroom whatever the address earns: a configured `capacity` keeps its
+   * meaning for a finger, and an address at twice the rate gets twice the room
+   * rather than being held to a finger's.
+   */
+  const roomFor = (rate: number): number => (refill > 0 ? capacity * (rate / refill) : capacity)
+
   /** Synchronous check-and-spend. Nothing awaits between reading and writing it. */
   function spend(address: string): number {
     const at = now()
-    const bucket = buckets.get(address) ?? { tokens: capacity, at }
-    const restored = ((at - bucket.at) / 1_000) * refill
+    const bucket = buckets.get(address) ?? { tokens: roomFor(refill), at, rate: refill }
+    const room = roomFor(bucket.rate)
+    const restored = ((at - bucket.at) / 1_000) * bucket.rate
     // Clamped at capacity on the way in, which is the line create-kei-game#42 is
     // missing. Idling buys back headroom; it never banks more than one burst.
-    bucket.tokens = Math.min(capacity, bucket.tokens + restored)
+    bucket.tokens = Math.min(room, bucket.tokens + restored)
     bucket.at = at
 
     if (bucket.tokens < 1) {
       buckets.set(address, bucket)
       throw new SessionError(
-        `That is faster than ${refill} presses a second. Wait a moment and press again.`,
+        `That is faster than ${Math.floor(bucket.rate)} presses a second. Wait a moment and press again.`,
       )
     }
     bucket.tokens -= 1
     buckets.set(address, bucket)
     return Math.floor(bucket.tokens)
+  }
+
+  /**
+   * Record the presses a second this address's machines demonstrably produce.
+   *
+   * Called from `bank()` with a figure `payoutFor` read off the chain — never
+   * from a request, because a caller naming its own rate is the cap removed. A
+   * raised rate raises the burst with it, or an address earning 27 a second would
+   * still be held to a finger's two seconds of headroom.
+   */
+  function machines(address: string, pressesPerSecond: number): void {
+    const rate = refill + Math.max(0, pressesPerSecond)
+    const bucket = buckets.get(address)
+    if (!bucket) {
+      buckets.set(address, { tokens: roomFor(rate), at: now(), rate })
+      return
+    }
+    // Only the ceiling moves. The tokens already spent stay spent, so telling the
+    // server about a purchase is not a way to refill by asking.
+    bucket.rate = rate
+    bucket.tokens = Math.min(bucket.tokens, roomFor(rate))
   }
 
   function touch(id: unknown, origin: string): LiveSession {
@@ -387,6 +447,8 @@ export function createSessions(options: SessionOptions): SessionRegistry {
       const session = sessions.get(id)
       if (session) session.observed += presses
     },
+
+    machines,
 
     redeem(id, origin, event) {
       const session = touch(id, origin)
