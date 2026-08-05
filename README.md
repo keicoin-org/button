@@ -119,8 +119,12 @@ it says on the screen that nothing is being banked.
 ## Honest about what this is not
 
 - **The client counts its own presses.** In single-player nothing else can see
-  them. There is a rate ceiling so the hole is worth a few coins rather than the
-  supply, and that is all it is. M8 adds Colyseus, and presses become observed.
+  them. A token bucket per address bounds what that is worth by elapsed time
+  rather than by request rate — 25 presses a second sustained, however often the
+  server is asked, plus four seconds' worth for a session that has been idle. It
+  is a ceiling and that is all it is: nothing here proves the caller owns the
+  address it banks to (issue #10), so it bounds one wallet and not one script.
+  M8 adds Colyseus, and presses become observed.
 - **The chain is a mock.** M2 is the real node; M3 points `/rpc` at it, and
   nothing above that line changes.
 - **The issuer seed is generated per run** unless `KEI_GAME_SEED` is set. A new

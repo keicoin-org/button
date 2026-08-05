@@ -14,7 +14,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { Kei, MockNode, randomSeed } from 'kei-transaction'
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
-import { startGame, type Game } from '../server/game.js'
+import { GameError, pressAllowance, startGame, type Game, type PressBucket } from '../server/game.js'
 
 const running: Array<{ close(): void }> = []
 
@@ -101,6 +101,34 @@ describe('pressing', () => {
     await player.claims.add(await game.bank(player.address, 1_000_000))
     expect(await coins.balance()).toBeLessThan(200)
   }, 20_000)
+
+  test('banking in a tight loop earns the rate, not the rate times the loop', async () => {
+    const { game, player } = await table({ pressRateCap: 25 })
+
+    // One call cannot tell a rate limit from a per-request cap, and a per-request
+    // cap is what this used to be: it added a whole rateCap to every request and
+    // subtracted nothing, so 200 requests a second bought 200 times the ceiling.
+    // What a cap claims is a bound over time, so time is what has to be measured.
+    const started = Date.now()
+    let granted = 0
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        granted += Number((await game.bank(player.address, 1_000_000)).amount)
+      } catch (error) {
+        // Refused for being too fast, which is the ceiling holding rather than
+        // failing. Anything else is a real fault and must not be swallowed into
+        // a test that then passes for having banked nothing.
+        if (!(error instanceof GameError)) throw error
+      }
+    }
+    const seconds = (Date.now() - started) / 1_000
+
+    // A full burst to start with, and the rate for as long as the loop ran. The
+    // player owns nothing, so a press is worth one coin and `rate` is the cap.
+    expect(granted).toBeLessThanOrEqual(25 * 4 + 25 * seconds)
+    // And it is a ceiling, not a wall: the first honest batch is paid in full.
+    expect(granted).toBeGreaterThanOrEqual(25 * 4)
+  }, 60_000)
 
   test('zero presses is a sentence, not a block', async () => {
     const { game, player } = await table()
@@ -229,6 +257,57 @@ describe('the exchange desk', () => {
     await player.claims.add(await game.bank(player.address, 9))
     expect(await coins.balance()).toBe(9)
   }, 30_000)
+})
+
+describe('the press rate ceiling', () => {
+  const rate = 25
+  const burst = rate * 4
+
+  test('an address nobody has seen starts with the burst and no more', () => {
+    const spent = pressAllowance(undefined, 1_000_000, 1_000, rate, burst)
+    expect(spent.counted).toBe(100)
+    expect(spent.bucket.budget).toBe(0)
+  })
+
+  test('a request earns nothing for being a request', () => {
+    // The defect as arithmetic: two requests 4 ms apart each used to get a whole
+    // rateCap on top of whatever elapsed time earned, so the ceiling went up when
+    // the caller sped up.
+    const first = pressAllowance(undefined, 1_000_000, 1_000, rate, burst)
+    const second = pressAllowance(first.bucket, 1_000_000, 1_004, rate, burst)
+    expect(second.counted).toBe(0)
+    // 4 ms at 25 a second is a tenth of a press, and it stays in the bucket
+    // rather than being rounded up to a grant.
+    expect(second.bucket.budget).toBeCloseTo(0.1)
+  })
+
+  test('elapsed time refills at the rate, and the burst is the ceiling', () => {
+    const empty: PressBucket = { budget: 0, at: 0 }
+    expect(pressAllowance(empty, 1_000_000, 2_000, rate, burst).counted).toBe(50)
+    expect(pressAllowance(empty, 1_000_000, 4_000, rate, burst).counted).toBe(100)
+    // An hour idle is still 100. Idling banks nothing past the burst, which is
+    // the half create-kei-game#42 is missing.
+    expect(pressAllowance(empty, 1_000_000, 3_600_000, rate, burst).counted).toBe(100)
+  })
+
+  test('what is counted comes out of the budget, so the rest is still there', () => {
+    const spent = pressAllowance({ budget: 40, at: 0 }, 12, 0, rate, burst)
+    expect(spent.counted).toBe(12)
+    expect(spent.bucket.budget).toBe(28)
+  })
+
+  test('a player whose machines press faster than a hand is not clipped for it', () => {
+    // Nine Auto-Pressers Mk II press 27 times a second, which is more than the
+    // 25 a finger is allowed. They are items on the chain, so the rate counts
+    // them — otherwise the cap would take earnings off the players who paid for
+    // the upgrade that produces them.
+    const owned = payoutFor({ 'auto-mk2': 9 })
+    expect(owned.pressesPerSecond).toBe(27)
+
+    const machines = rate + owned.pressesPerSecond
+    const spent = pressAllowance({ budget: 0, at: 0 }, 27, 1_000, machines, machines * 4)
+    expect(spent.counted).toBe(27)
+  })
 })
 
 describe('the price list', () => {

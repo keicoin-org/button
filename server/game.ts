@@ -48,6 +48,17 @@ export interface Game {
 
 /** Fast for a finger, slow for a script. */
 const DEFAULT_PRESS_RATE_CAP = 25
+/**
+ * Seconds of the rate a bucket may hold at once, for a session that has not
+ * banked recently.
+ *
+ * The client banks every 20 presses or 3 seconds (`src/economy.ts`), and presses
+ * keep accumulating while a bank is in flight, so a batch can legitimately carry
+ * more than three seconds of them when a round trip is slow. This is that, with
+ * room to spare, and it is the whole of what idling buys — a bucket cannot bank
+ * allowance past it however long nobody presses.
+ */
+const PRESS_BURST_SECONDS = 4
 /** An order nobody paid for is forgotten after this long. */
 const ORDER_TTL_MS = 120_000
 
@@ -96,8 +107,9 @@ export async function startGame(options: GameOptions): Promise<Game> {
 
   const shop = openShop(kei, coins, items)
   const drops = new DropBatch(coins, options.flushMs ?? 1_500)
-  const lastBank = new Map<string, number>()
   const rateCap = options.pressRateCap ?? DEFAULT_PRESS_RATE_CAP
+  const burst = rateCap * PRESS_BURST_SECONDS
+  const buckets = new Map<string, PressBucket>()
   const lootClaims = new Map<string, Promise<ClaimBundle>>()
 
   return {
@@ -114,20 +126,45 @@ export async function startGame(options: GameOptions): Promise<Game> {
     },
 
     async bank(address, presses) {
-      const now = Date.now()
-      const since = now - (lastBank.get(address) ?? now - 1_000)
-      lastBank.set(address, now)
+      const wanted = Math.floor(presses)
+      if (!(wanted > 0)) throw new GameError('That was zero presses.')
+
+      // Holdings first, because they decide two things: what a press is worth,
+      // and how fast this address is allowed to press. A player who bought three
+      // arms a second should not be clipped to a finger's rate for owning them,
+      // and what they own is on the chain rather than in the request.
+      const { perPress, pressesPerSecond } = payoutFor(await ownedBy(kei, address, items))
+      const rate = rateCap + pressesPerSecond
 
       // The client counts the presses, because in single-player nothing else
       // sees them. That is a real trust hole and this is not a fix for it — it
-      // is a ceiling, so the hole is worth a few coins rather than the supply.
-      // M8 puts Colyseus in the room and the presses become observed.
-      const allowed = Math.max(1, Math.ceil((since / 1_000) * rateCap) + rateCap)
-      const counted = Math.min(Math.floor(presses), allowed)
-      if (!(counted > 0)) throw new GameError('That was zero presses.')
+      // is a bucket, so what the hole is worth is bounded by elapsed time rather
+      // than by request rate: `rate` presses a second sustained, however often it
+      // is asked, plus at most `burst` for a session that has been idle. At the
+      // default that is 25 a second, or 90,000 an hour against a supply of
+      // 1,000,000,000. M8 puts Colyseus in the room and the presses become
+      // observed. Note the key is the address and nothing proves the caller owns
+      // it, so a script can still spread this over invented addresses — that is
+      // #10's subject, and no arithmetic here can close it.
+      const now = Date.now()
+      for (const [who, bucket] of buckets) {
+        // A bucket idle long enough to have refilled to `burst` is worth exactly
+        // what a missing one is worth, so dropping it grants nothing and the map
+        // stops being a list of every address that ever banked. `rateCap` is the
+        // slowest any address refills, so this waits long enough for all of them.
+        if (now - bucket.at > PRESS_BURST_SECONDS * 1_000) buckets.delete(who)
+      }
 
-      const { perPress } = payoutFor(await ownedBy(kei, address, items))
-      return drops.add(address, counted * perPress)
+      // Nothing is awaited between reading the bucket and writing it back, which
+      // is what makes the refill and the subtraction one step: two requests for
+      // one address cannot both spend the same budget.
+      const spent = pressAllowance(buckets.get(address), wanted, now, rate, burst)
+      buckets.set(address, spent.bucket)
+      if (spent.counted <= 0) {
+        throw new GameError(`That is faster than ${rate} presses a second. Wait a moment, then press again.`)
+      }
+
+      return drops.add(address, spent.counted * perPress)
     },
 
     loot(address, mob) {
@@ -158,6 +195,50 @@ export async function startGame(options: GameOptions): Promise<Game> {
 }
 
 export class GameError extends Error {}
+
+// ---------------------------------------------------------------- press rate
+
+/** One address's press allowance, and the moment it was last brought up to date. */
+export interface PressBucket {
+  /** Presses still available as of `at`. Fractional, so slow refills are not lost. */
+  budget: number
+  at: number
+}
+
+/**
+ * How many of `wanted` presses may be banked now, and the bucket that leaves.
+ *
+ * A token bucket, which is the one shape whose ceiling holds however often it is
+ * asked: the budget earns `rate` presses a second up to `burst`, and every press
+ * counted comes back out of it. Both halves are load-bearing. The formula this
+ * replaces added a whole `rateCap` to *every request* and subtracted nothing, so
+ * elapsed time never bounded anything and the ceiling scaled with request rate —
+ * two requests 4 ms apart each got the full grant, and 200 requests a second
+ * bought 200 times the intended presses. A cap that goes up when you ask faster
+ * is not a cap.
+ *
+ * Pure, so the arithmetic can be checked without a chain: the property under test
+ * is what N calls add up to over an interval, and that is not something a single
+ * call's return value can show.
+ */
+export function pressAllowance(
+  bucket: PressBucket | undefined,
+  wanted: number,
+  now: number,
+  rate: number,
+  burst: number,
+): { counted: number; bucket: PressBucket } {
+  // An address nobody has seen is a session that has not banked recently, which
+  // is exactly what `burst` is for, so it starts full. That is also what makes
+  // the sweep in `bank` exact: a bucket left to refill to `burst` becomes
+  // indistinguishable from one that was never there, so forgetting it is free.
+  const budget =
+    bucket === undefined ? burst : Math.min(burst, bucket.budget + ((now - bucket.at) / 1_000) * rate)
+  // Whole presses out, the fraction left in — otherwise a client banking twice a
+  // second would round its way to nothing.
+  const counted = Math.min(wanted, Math.floor(budget))
+  return { counted, bucket: { budget: budget - counted, at: now } }
+}
 
 // --------------------------------------------------------------------- drops
 
