@@ -11,7 +11,7 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { Kei, MockNode, randomSeed } from 'kei-transaction'
+import { Kei, MockNode, randomSeed, type ClaimBundle } from 'kei-transaction'
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
 import { GameError, pressAllowance, startGame, type Game, type PressBucket } from '../server/game.js'
@@ -102,29 +102,37 @@ describe('pressing', () => {
     expect(await coins.balance()).toBeLessThan(200)
   }, 20_000)
 
-  test('banking in a tight loop earns the rate, not the rate times the loop', async () => {
+  test('a hundred banks at once earn the rate, not a hundred times the rate', async () => {
     const { game, player } = await table({ pressRateCap: 25 })
+    const coins = await player.token(game.catalogue().coin.asset)
 
-    // One call cannot tell a rate limit from a per-request cap, and a per-request
-    // cap is what this used to be: it added a whole rateCap to every request and
-    // subtracted nothing, so 200 requests a second bought 200 times the ceiling.
-    // What a cap claims is a bound over time, so time is what has to be measured.
+    // One call cannot tell a rate limit from a per-request cap, which is why the
+    // suite used to assert the ceiling existed without ever asserting it held.
+    // A hundred at once is the shape that separates them: a bound over time does
+    // not move when the requests arrive together, and a per-request grant does.
     const started = Date.now()
-    let granted = 0
-    for (let attempt = 0; attempt < 100; attempt++) {
-      try {
-        granted += Number((await game.bank(player.address, 1_000_000)).amount)
-      } catch (error) {
-        // Refused for being too fast, which is the ceiling holding rather than
-        // failing. Anything else is a real fault and must not be swallowed into
-        // a test that then passes for having banked nothing.
-        if (!(error instanceof GameError)) throw error
-      }
-    }
+    const settled = await Promise.allSettled(
+      Array.from({ length: 100 }, () => game.bank(player.address, 1_000_000)),
+    )
     const seconds = (Date.now() - started) / 1_000
 
-    // A full burst to start with, and the rate for as long as the loop ran. The
-    // player owns nothing, so a press is worth one coin and `rate` is the cap.
+    const roots = new Map<string, ClaimBundle>()
+    for (const result of settled) {
+      if (result.status === 'rejected') {
+        // Refused for being too fast is the ceiling holding. Anything else is a
+        // real fault, and swallowing it would let this pass for banking nothing.
+        if (!(result.reason instanceof GameError)) throw result.reason
+        continue
+      }
+      // Presses banked in one window are merged into one entitlement per address
+      // (see DropBatch), so one root comes back to several callers. Claim each
+      // root once and let the chain say what the hundred requests were worth.
+      roots.set(result.value.root, result.value)
+    }
+    for (const bundle of roots.values()) await player.claims.add(bundle)
+    const granted = await coins.balance()
+
+    // A full burst, plus the rate for however long the hundred took to settle.
     expect(granted).toBeLessThanOrEqual(25 * 4 + 25 * seconds)
     // And it is a ceiling, not a wall: the first honest batch is paid in full.
     expect(granted).toBeGreaterThanOrEqual(25 * 4)
