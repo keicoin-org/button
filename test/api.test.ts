@@ -25,7 +25,7 @@ import { handleGameApi } from '../server/api.js'
 import { handleArenaRequest } from '../worker/router.js'
 import type { Game } from '../server/game.js'
 import { sign } from '../src/ownership.js'
-import { table, type Table } from './support.js'
+import { batchId, table, type Table } from './support.js'
 
 const running: Array<{ close(): void }> = []
 afterEach(() => {
@@ -142,6 +142,7 @@ describe('a caller cannot state its own reward', () => {
     // spelling the old route understood.
     const { status, body } = await arena.door('/game/bank', {
       session,
+      batch: batchId(),
       presses: 1_000_000,
       count: 1_000_000,
       amount: 1_000_000,
@@ -160,11 +161,48 @@ describe('a caller cannot state its own reward', () => {
     // A body naming a victim. The payout goes to the proven wallet regardless,
     // because the address is not something this route reads.
     const victim = (await keyPairFromSeed(randomSeed(), 0)).address
-    const { body } = await arena.door('/game/bank', { session, address: victim })
+    const { body } = await arena.door('/game/bank', { session, batch: batchId(), address: victim })
     const coins = await arena.player.token(arena.game.catalogue().coin.asset)
     await arena.player.claims.add(body.bundle)
     expect(await coins.balance()).toBe(4)
     expect(await coins.balanceOf(victim)).toBe(0)
+  })
+})
+
+describe('a bank names its batch', () => {
+  forEachDoor('the same batch id twice is answered with the same proof', async (arena) => {
+    const session = await authenticate(arena)
+    await pressThrough(arena, session, 6)
+
+    const batch = batchId()
+    // The first answer is signed and then lost on the way back. The client has
+    // no proof and cannot tell that from a request that never arrived, so it
+    // sends the batch again.
+    const lost = await arena.door('/game/bank', { session, batch })
+    const recovered = await arena.door('/game/bank', { session, batch })
+
+    expect(recovered.status).toBe(200)
+    expect(recovered.body.bundle.root).toBe(lost.body.bundle.root)
+
+    await arena.player.claims.add(recovered.body.bundle)
+    const coins = await arena.player.token(arena.game.catalogue().coin.asset)
+    expect(await coins.balance()).toBe(6)
+  })
+
+  forEachDoor('a bank with no batch id is refused, and the presses survive it', async (arena) => {
+    const session = await authenticate(arena)
+    await pressThrough(arena, session, 4)
+
+    const { status, body } = await arena.door('/game/bank', { session })
+    expect(status).toBe(400)
+    expect(body.bundle).toBeUndefined()
+    expect(body.error).toMatch(/batch id/)
+
+    // Refused before the tally was touched, so the presses are still owed.
+    const { body: paid } = await arena.door('/game/bank', { session, batch: batchId() })
+    await arena.player.claims.add(paid.bundle)
+    const coins = await arena.player.token(arena.game.catalogue().coin.asset)
+    expect(await coins.balance()).toBe(4)
   })
 })
 
@@ -243,7 +281,7 @@ describe('parallel requests', () => {
     await pressThrough(arena, session, 12)
 
     const banks = await Promise.all(
-      Array.from({ length: 20 }, () => arena.door('/game/bank', { session })),
+      Array.from({ length: 20 }, () => arena.door('/game/bank', { session, batch: batchId() })),
     )
     const paid = banks.filter((bank) => bank.status === 200)
     expect(paid).toHaveLength(1)
@@ -260,14 +298,21 @@ describe('parallel requests', () => {
 
       // Four hundred presses as fast as the transport will carry them. Under the
       // formula this replaces, each request carried its own fresh grant.
+      const started = Date.now()
       const results = await Promise.all(
         Array.from({ length: 400 }, () => arena.door('/game/press', { session })),
       )
+      const elapsed = Date.now() - started
       const watched = results.filter((result) => result.status === 200).length
-      expect(watched).toBeLessThanOrEqual(15)
+
+      // The bound is the ceiling's own arithmetic — a full burst, plus what
+      // refills while the flood is in the air — rather than a figure that only
+      // holds while the flood happens to take under a second. A slow machine
+      // makes the flood longer, and a longer flood legitimately allows more.
+      expect(watched).toBeLessThanOrEqual(10 + Math.ceil((elapsed / 1_000) * 5))
       expect(watched).toBeGreaterThanOrEqual(10)
 
-      const { body } = await arena.door('/game/bank', { session })
+      const { body } = await arena.door('/game/bank', { session, batch: batchId() })
       await arena.player.claims.add(body.bundle)
       const coins = await arena.player.token(arena.game.catalogue().coin.asset)
       expect(await coins.balance()).toBe(watched)
@@ -282,7 +327,7 @@ describe('the claim flow is unchanged', () => {
     const session = await authenticate(arena)
     await pressThrough(arena, session, 5)
 
-    const { body } = await arena.door('/game/bank', { session })
+    const { body } = await arena.door('/game/bank', { session, batch: batchId() })
     // Still a rooted claim bundle, still claimed by the player's own wallet from
     // the player's own chain. Authentication decides who may be paid; it does
     // not become the thing that pays.
