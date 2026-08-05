@@ -118,9 +118,17 @@ it says on the screen that nothing is being banked.
 
 ## Honest about what this is not
 
-- **The client counts its own presses.** In single-player nothing else can see
-  them. There is a rate ceiling so the hole is worth a few coins rather than the
-  supply, and that is all it is. M8 adds Colyseus, and presses become observed.
+- **The server counts the presses, and bounds them by elapsed time.** One press
+  is one request that reached the server, drawn against a token bucket per proven
+  address: 25 a second sustained however often the server is asked, plus two
+  seconds' worth of headroom for a session that has been idle, and no more
+  however long it idles. An address whose on-chain machines press for it earns
+  that rate on top — nine Auto-Pressers Mk II are 27 a second and are not clipped
+  for it, because the ceiling reads what they own off the chain rather than out of
+  the request. What is left is a wallet whose holder has proved they hold it (#10)
+  pressing at about a finger's speed, rather than a client that could claim any
+  number it liked. M8 adds Colyseus, and presses become observed by other players
+  too.
 - **The chain is a mock.** M2 is the real node; M3 points `/rpc` at it, and
   nothing above that line changes.
 - **The issuer seed is generated per run** unless `KEI_GAME_SEED` is set. A new

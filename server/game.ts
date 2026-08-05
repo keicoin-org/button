@@ -174,7 +174,12 @@ export async function startGame(options: GameOptions): Promise<Game> {
       const { session: who, presses } = sessions.take(session, origin)
 
       try {
-        const { perPress } = payoutFor(await ownedBy(kei, who.address, items))
+        const { perPress, pressesPerSecond } = payoutFor(await ownedBy(kei, who.address, items))
+        // The same holdings read that prices a press also says how fast this
+        // address may press: machines on the chain press faster than a hand, and
+        // the ceiling has to count them or it clips the player who bought them.
+        // This is the one place the figure comes from — the chain, never a request.
+        sessions.machines(who.address, pressesPerSecond)
         return await drops.add(who.address, presses * perPress)
       } catch (error) {
         // Nothing was published, so the presses were never spent. They go back
