@@ -11,9 +11,10 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import type { ClaimBundle } from 'kei-transaction'
+import { Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
+import { startGame } from '../server/game.js'
 import { ORIGIN, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
@@ -33,6 +34,26 @@ async function table(options: { exchange?: boolean; pressRateCap?: number } = {}
   const built = await freshTable(options)
   running.push(built)
   return { ...built, session: await open(built.game, built.player) }
+}
+
+/**
+ * The same chain, with one block refused: the mint that would deliver `item`.
+ *
+ * That is what supply running out between an order and its payment looks like
+ * from the shop's side, and what a node that timed out looks like too — the two
+ * ways a paid-for delivery fails (SPEC §5.6.6). Nothing in the game is stubbed:
+ * the failure is injected at the node interface the SDK is written against, so
+ * what is under test is the shop's real recovery path.
+ */
+function nodeRefusingToMint(node: MockNode, item: () => string | null): KeiNode {
+  return Object.assign(Object.create(node) as MockNode, {
+    async process(block: Block): Promise<{ hash: string }> {
+      if (block.type === 'asset' && block.op.kind === 'mint' && block.op.asset === item()) {
+        throw new Error('over-supply: no units of this asset are left to mint')
+      }
+      return node.process(block)
+    },
+  })
 }
 
 describe('pressing', () => {
@@ -158,6 +179,125 @@ describe('the shop', () => {
       'Golden Button Cap costs 6000 coins and you have 0. Press the button a few more times.',
     )
   }, 20_000)
+
+  test('the second buyer of the supply-one cap is refused, and not charged for it', async () => {
+    const { game, player, node, session } = await table()
+    const catalogue = game.catalogue()
+    const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
+
+    const second = await Kei.start({ node, seed: randomSeed() })
+    running.push(second)
+    const theirSession = await open(game, second)
+    const mine = await player.token(catalogue.coin.asset)
+    const theirs = await second.token(catalogue.coin.asset)
+
+    // Both players can afford it. Only one of them can own it.
+    press(game, session, cap.price)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    press(game, theirSession, cap.price)
+    await second.claims.add(await game.bank(theirSession, ORIGIN))
+
+    const order = await game.order(session, ORIGIN, 'cap')
+    await mine.transfer(order.to, order.price)
+    await until(async () => (await second.items.owner(cap.asset)) === player.address, 'the cap to arrive')
+
+    const before = await theirs.balance()
+    expect(before).toBe(cap.price)
+    // The refusal has to land before any coins move: a transfer is signed by the
+    // player, settled by the chain, and final, so a shop that takes the money
+    // first has nothing left to offer but an apology.
+    await expect(game.order(theirSession, ORIGIN, 'cap')).rejects.toThrow('The Golden Button Cap is sold out.')
+    expect(await theirs.balance()).toBe(before)
+  }, 30_000)
+
+  test('two players cannot both be told to pay for the one copy', async () => {
+    const { game, player, node, session } = await table()
+    const catalogue = game.catalogue()
+    const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
+
+    const second = await Kei.start({ node, seed: randomSeed() })
+    running.push(second)
+    const theirSession = await open(game, second)
+    press(game, session, cap.price)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    press(game, theirSession, cap.price)
+    await second.claims.add(await game.bank(theirSession, ORIGIN))
+
+    // Neither has paid, so the chain still says one is unsold. Reading the supply
+    // and then taking the order as two steps is what let both of these through.
+    const taken = await Promise.allSettled([
+      game.order(session, ORIGIN, 'cap'),
+      game.order(theirSession, ORIGIN, 'cap'),
+    ])
+    expect(taken.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+  }, 30_000)
+
+  test('a delivery the chain refuses returns the coins instead of keeping them', async () => {
+    const node = await MockNode.create()
+    let blocked: string | null = null
+    const game = await startGame({
+      seed: randomSeed(),
+      node: nodeRefusingToMint(node, () => blocked),
+      network: 'mock',
+      flushMs: 20,
+      pressRateCap: 100_000,
+    })
+    const player = await Kei.start({ node, seed: randomSeed() })
+    running.push(game, player)
+
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+    const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+    blocked = glove.asset
+
+    const session = await open(game, player)
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    const before = await coins.balance()
+
+    const order = await game.order(session, ORIGIN, 'glove')
+    await coins.transfer(order.to, order.price)
+    await until(async () => (await coins.balance()) === before, 'the coins to come back')
+    expect(await player.items.owner(glove.asset)).toBe(null)
+  }, 30_000)
+
+  test('a payment short of the price comes back, and the order stays open', async () => {
+    const { game, player, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+    const knuckle = catalogue.upgrades.find((upgrade) => upgrade.sku === 'knuckle')!
+
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    const before = await coins.balance()
+
+    // What a player who re-clicked a dearer row mid-transfer sends: the amount for
+    // the row they left, against the order for the row they are on.
+    const order = await game.order(session, ORIGIN, 'knuckle')
+    await coins.transfer(order.to, 25)
+    await until(async () => (await coins.balance()) === before, 'the short payment to come back')
+    expect(await player.items.owner(knuckle.asset)).toBe(null)
+
+    // The short payment did not consume the order, so paying properly still works.
+    await coins.transfer(order.to, order.price)
+    await until(async () => (await player.items.owner(knuckle.asset)) === player.address, 'the knuckle to arrive')
+  }, 30_000)
+
+  test('paying over the price delivers the item and returns the difference', async () => {
+    const { game, player, session } = await table()
+    const catalogue = game.catalogue()
+    const coins = await player.token(catalogue.coin.asset)
+    const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+
+    press(game, session, 400)
+    await player.claims.add(await game.bank(session, ORIGIN))
+    const before = await coins.balance()
+
+    const order = await game.order(session, ORIGIN, 'glove')
+    await coins.transfer(order.to, order.price + 5)
+    await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
+    await until(async () => (await coins.balance()) === before - order.price, 'the difference to come back')
+  }, 30_000)
 
   test('the shop does not sell things it does not sell', async () => {
     const { game, session } = await table()
