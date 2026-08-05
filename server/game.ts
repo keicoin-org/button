@@ -17,7 +17,8 @@
 import { Kei, KEI_DECIMALS, issuanceBurn, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
 import type { KeiNode } from 'kei-transaction'
 
-import type { OwnershipChallengeMessage } from '../shared/ownership.js'
+import { randomChallengeNonce, type OwnershipChallengeMessage } from '../shared/ownership.js'
+import type { PurchaseReceipt } from '../shared/purchase.js'
 import {
   COIN,
   COINS_PER_KEI,
@@ -86,7 +87,20 @@ export interface Game {
    */
   faucet(session: unknown, origin: string): Promise<{ granted: number }>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
-  order(session: unknown, origin: string, sku: string): Promise<{ to: string; price: number; asset: string }>
+  order(
+    session: unknown,
+    origin: string,
+    sku: string,
+  ): Promise<{ id: string; to: string; price: number; asset: string }>
+  /**
+   * How this wallet's recent purchases ended.
+   *
+   * The only channel there is from the shop back to the player. A purchase is a
+   * transfer the browser signs and an issuer block it has no part in, so without
+   * this the optimistic message is the last thing shown whether the item arrived
+   * or the coins came back. Newest last, and answered to the proven wallet only.
+   */
+  purchases(session: unknown, origin: string): PurchaseReceipt[]
   close(): void
 }
 
@@ -155,6 +169,16 @@ const ORDER_TTL_MS = 120_000
 const BATCH_TTL_MS = 5 * 60_000
 /** Batches remembered. Past this the oldest is dropped and its retry refused. */
 const MAX_REMEMBERED_BATCHES = 4_096
+/**
+ * How long the shop can still say how a purchase ended.
+ *
+ * Longer than an order lives, because the question is asked after the order is
+ * gone — including by a browser that was reloaded mid-purchase and is asking on
+ * the strength of its wallet alone.
+ */
+const RECEIPT_TTL_MS = 10 * 60_000
+/** Receipts kept per address. A short tail, not a second ledger. */
+const RECEIPTS_KEPT = 8
 
 export async function startGame(options: GameOptions): Promise<Game> {
   const kei = await Kei.server({
@@ -318,6 +342,14 @@ export async function startGame(options: GameOptions): Promise<Game> {
       // wrong item.
       const { address } = sessions.require(session, origin)
       return shop.order(address, sku)
+    },
+
+    purchases(session, origin) {
+      // The proven wallet's own, and nobody's else's: a receipt names what
+      // somebody paid and what they were given, which is not a thing a session
+      // gets to ask about another address.
+      const { address } = sessions.require(session, origin)
+      return shop.purchases(address)
     },
 
     close() {
@@ -575,6 +607,14 @@ interface Order {
   price: bigint
   at: number
   /**
+   * What the player will be told happened to this.
+   *
+   * The same object the address's receipt list holds, so a settle branch writing
+   * the ending here is the ending the player reads — there is no second place
+   * for the two to disagree.
+   */
+  receipt: PurchaseReceipt
+  /**
    * A payment for this order is being honoured right now.
    *
    * It is what stops a second arrival from delivering the same order twice, and
@@ -606,7 +646,11 @@ function openShop(
   kei: Kei,
   coins: IssuerToken,
   items: ReadonlyMap<string, Item>,
-): { order(address: string, sku: string): Promise<{ to: string; price: number; asset: string }>; close(): void } {
+): {
+  order(address: string, sku: string): Promise<{ id: string; to: string; price: number; asset: string }>
+  purchases(address: string): PurchaseReceipt[]
+  close(): void
+} {
   // Whole coins are raw coins here: COIN has 0 decimals (shared/catalogue.ts),
   // so every figure below is both, and BigInt keeps it that way from the node's
   // raw decimal strings (SPEC §5.10) through to the comparison that decides
@@ -620,6 +664,45 @@ function openShop(
   }
 
   const orders = new Map<string, Order>()
+
+  /**
+   * What became of each of an address's recent purchases, newest last.
+   *
+   * Kept past the order it describes, and past the arrival that settled it,
+   * because the question it answers is asked *after* both — including by a
+   * browser that was reloaded in the middle and has nothing left but its wallet.
+   * Bounded per address and swept by age, so it is a short tail rather than a
+   * second ledger; the chain remains the record of what was paid.
+   */
+  const receipts = new Map<string, PurchaseReceipt[]>()
+
+  const remember = (address: string, receipt: PurchaseReceipt): PurchaseReceipt => {
+    const at = Date.now()
+    for (const [who, list] of receipts) {
+      const kept = list.filter((entry) => at - entry.at <= RECEIPT_TTL_MS)
+      if (kept.length === 0) receipts.delete(who)
+      else receipts.set(who, kept)
+    }
+    const list = receipts.get(address) ?? []
+    list.push(receipt)
+    receipts.set(address, list.slice(-RECEIPTS_KEPT))
+    return receipt
+  }
+
+  /**
+   * A receipt for coins that matched no open order.
+   *
+   * Blank, because `returnTo` is what fills in what went back and why — there is
+   * one place that writes an ending, and this is only the sheet it writes on.
+   */
+  const unmatched = (address: string): PurchaseReceipt =>
+    remember(address, {
+      id: `unmatched-${randomChallengeNonce().slice(0, 16)}`,
+      state: 'open',
+      paid: 0,
+      returned: 0,
+      at: Date.now(),
+    })
 
   /**
    * Copies nobody owns yet, read off the chain rather than counted here.
@@ -657,26 +740,57 @@ function openShop(
    * the whole game server down over one purchase. That is the same hazard, and
    * the same fix, as world-of-wonder's `dropCTRL.ts`.
    */
+  /**
+   * Give coins back, and write down that they went back.
+   *
+   * The two are one step from the player's side, but not one step in the code:
+   * the receipt is written *after* `refund` resolves, not before. Writing
+   * "returned" first and then awaiting the transfer would let a caller who asks
+   * `purchases()` in that gap read an ending that has not happened yet — and if
+   * the transfer itself then fails, a receipt that already says "returned" is
+   * exactly the false positive this channel exists to prevent. If `refund`
+   * throws, this throws too, and no ending is recorded — which is honest: the
+   * shop does not yet know one.
+   */
+  const returnTo = async (to: string, amount: bigint, because: string, receipt: PurchaseReceipt): Promise<void> => {
+    // Nothing to give back is not an outcome, and writing a reason for it would
+    // put "it was more than it costs" on an exact payment.
+    if (amount <= 0n) return
+    await refund(to, amount, because)
+    receipt.state = receipt.state === 'delivered' ? 'delivered' : 'returned'
+    receipt.returned += Number(amount)
+    receipt.reason = because
+    receipt.at = Date.now()
+  }
+
   const settle = async (from: string, paid: bigint): Promise<void> => {
     const order = orders.get(from)
 
     // Coins against no order: a payment for an order that already expired, one
     // sent by hand, or a second payment for an order being delivered. Keeping
-    // them would be charging for nothing, so they go back.
-    if (!order) return refund(from, paid, 'the shop had no open order for it')
-    if (order.settling) return refund(from, paid, 'the order it was for is already being delivered')
+    // them would be charging for nothing, so they go back — and the player is
+    // told so, because coins leaving and coins coming back look the same from a
+    // wallet if nothing says which happened.
+    if (!order) return returnTo(from, paid, 'the shop had no open order for it', unmatched(from))
+    if (order.settling) {
+      return returnTo(from, paid, 'the order it was for is already being delivered', unmatched(from))
+    }
 
     const upgrade = upgradeBySku(order.sku)
     const item = items.get(order.sku)
     // Orders only ever hold a sku `order()` accepted, so this cannot fire — but
     // returning the coins is the right answer even to a state that cannot happen.
-    if (!upgrade || !item) return refund(from, paid, 'the shop no longer sells that')
+    if (!upgrade || !item) return returnTo(from, paid, 'the shop no longer sells that', order.receipt)
 
     if (paid < order.price) {
       // The order stays open, so the right payment still lands the item. The
       // short one goes back rather than sitting here as an unrecorded windfall,
-      // which is what a bare `return` made of it.
-      return refund(from, paid, `${upgrade.name} costs ${order.price} coins and ${paid} arrived`)
+      // which is what a bare `return` made of it. The receipt says so and the
+      // order stays open behind it, so the next payment writes its own ending.
+      const short = unmatched(from)
+      short.sku = order.sku
+      short.item = upgrade.name
+      return returnTo(from, paid, `${upgrade.name} costs ${order.price} coins and ${paid} arrived`, short)
     }
 
     order.settling = true
@@ -688,16 +802,20 @@ function openShop(
       // owed their coins, and this is the only place that can pay them.
       console.error(`[shop] the ${upgrade.name} for ${from} did not mint:`, error)
       orders.delete(from)
-      return refund(from, paid, `the shop could not deliver the ${upgrade.name}`)
+      return returnTo(from, paid, `the shop could not deliver the ${upgrade.name}`, order.receipt)
     }
 
-    // Delivered, so the order is spent and the record can go.
+    // Delivered, so the order is spent and the record can go. The receipt is not
+    // the order and outlives it: it is the answer to a question asked afterwards.
     orders.delete(from)
+    order.receipt.state = 'delivered'
+    order.receipt.paid = Number(order.price)
+    order.receipt.at = Date.now()
     // The shop is a sink: coins spent here stop existing, which frees the
     // headroom they took under the cap (SPEC §5.6.6). Only the price is burned;
     // anything above it was never the shop's.
     await coins.burn(order.price.toString())
-    await refund(from, paid - order.price, `it was more than the ${upgrade.name} costs`)
+    await returnTo(from, paid - order.price, `it was more than the ${upgrade.name} costs`, order.receipt)
   }
 
   const stop = kei.on('asset-received', (arrival) => {
@@ -757,9 +875,25 @@ function openShop(
       }
       if (unsold !== null && unsold - spokenFor <= 0n) throw new GameError(soldOut(upgrade, unsold))
 
-      orders.set(address, { sku, price, at: Date.now(), settling: false })
-      return { to: kei.address, price: upgrade.price, asset: coins.id }
+      const receipt = remember(address, {
+        id: randomChallengeNonce(),
+        state: 'open',
+        sku,
+        // The name, because that is what a player is shown. The asset id exists
+        // and is not it (kei-transaction#130).
+        item: upgrade.name,
+        paid: 0,
+        returned: 0,
+        at: Date.now(),
+      })
+      orders.set(address, { sku, price, at: Date.now(), settling: false, receipt })
+      return { id: receipt.id, to: kei.address, price: upgrade.price, asset: coins.id }
     },
+
+    purchases(address) {
+      return (receipts.get(address) ?? []).map((receipt) => ({ ...receipt }))
+    },
+
     close: stop,
   }
 }

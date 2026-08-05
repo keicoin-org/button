@@ -22,6 +22,9 @@ const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
 const RED = '#f87171'
 
+/** What a sentence looks like, by what kind of sentence it is. */
+const TONES = { good: GREEN, warn: AMBER, note: INK } as const
+
 const KEI_COIN = new Image()
 KEI_COIN.src = './kei-coin-64.png'
 
@@ -123,10 +126,12 @@ export function drawBalance(ctx: Ctx, state: EconomyState): void {
   ctx.fillText(keiStatus, width - 34, 238)
 
   // The message line is the only place errors are shown, and they are shown as
-  // the SDK wrote them (SPEC §6.1).
+  // the SDK wrote them (SPEC §6.1). Its colour is the tone the message was
+  // written with, because the two endings a purchase can have — the item, or the
+  // coins back — are opposite news and had been arriving in the same amber.
   ctx.textAlign = 'left'
   ctx.font = `500 21px ${FONT}`
-  ctx.fillStyle = state.message ? AMBER : DIM
+  ctx.fillStyle = state.message === null ? DIM : TONES[state.tone]
   wrap(ctx, state.message ?? state.address, 34, 302, width - 68, 26, 2)
 }
 

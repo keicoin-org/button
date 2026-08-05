@@ -14,6 +14,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { KEI_DECIMALS, Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
 
 import { COIN, COINS_PER_KEI, UPGRADES, payoutFor, upgradeBySku } from '../shared/catalogue.js'
+import { purchaseMessage, purchaseTone } from '../shared/purchase.js'
 import { issuanceCost, startGame } from '../server/game.js'
 import { ORIGIN, bank, batchId, join, kill, open, press, table as freshTable, until } from './support.js'
 
@@ -403,6 +404,167 @@ describe('the shop', () => {
     await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
     await until(async () => (await coins.balance()) === before - order.price, 'the difference to come back')
   }, 30_000)
+
+  /**
+   * The half of a purchase the player could not see.
+   *
+   * PR #13 made every arrival reach one of two endings — the item, or the coins
+   * back. These say the player can tell which one happened, because before this
+   * they could not: the optimistic "it will arrive in a moment" was the last
+   * thing on the screen either way, and a refund nobody is told about is close
+   * to indistinguishable from money that vanished.
+   */
+  describe('what the player is told', () => {
+    test('a delivered purchase reads as delivered, by name', async () => {
+      const { game, player, session } = await table()
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+      const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+
+      const order = await game.order(session, ORIGIN, 'glove')
+      // Open before anything is paid, and honest about it.
+      expect(game.purchases(session, ORIGIN).at(-1)).toMatchObject({ id: order.id, state: 'open' })
+
+      await coins.transfer(order.to, order.price)
+      await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
+      await until(
+        async () => game.purchases(session, ORIGIN).at(-1)?.state === 'delivered',
+        'the shop to say it delivered',
+      )
+
+      const receipt = game.purchases(session, ORIGIN).at(-1)!
+      expect(receipt).toMatchObject({ id: order.id, state: 'delivered', item: 'Springy Glove', paid: 25, returned: 0 })
+      // The name, never the asset id (kei-transaction#130).
+      expect(receipt.item).not.toBe(glove.asset)
+      expect(purchaseMessage(receipt)).toBe('The Springy Glove arrived.')
+      expect(purchaseTone(receipt)).toBe('good')
+    }, 30_000)
+
+    test('a refunded purchase reads as refunded, with the amount and the reason', async () => {
+      const node = await MockNode.create()
+      let blocked: string | null = null
+      const game = await startGame({
+        seed: randomSeed(),
+        node: nodeRefusingToMint(node, () => blocked),
+        network: 'mock',
+        flushMs: 20,
+        pressRateCap: 100_000,
+      })
+      const player = await Kei.start({ node, seed: randomSeed() })
+      running.push(game, player)
+
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+      const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+      blocked = glove.asset
+
+      const session = await open(game, player)
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+      const before = await coins.balance()
+
+      const order = await game.order(session, ORIGIN, 'glove')
+      await coins.transfer(order.to, order.price)
+      await until(async () => (await coins.balance()) === before, 'the coins to come back')
+      await until(
+        async () => game.purchases(session, ORIGIN).at(-1)?.state === 'returned',
+        'the shop to say it refunded',
+      )
+
+      const receipt = game.purchases(session, ORIGIN).at(-1)!
+      expect(receipt).toMatchObject({ id: order.id, state: 'returned', returned: 25, paid: 0 })
+      expect(purchaseMessage(receipt)).toBe('Your 25 coins came back: the shop could not deliver the Springy Glove.')
+      // Which is the whole point: this and a delivery are different sentences in
+      // different colours, and were the same silence before.
+      expect(purchaseTone(receipt)).toBe('warn')
+    }, 30_000)
+
+    test('change from an overpayment is accounted for rather than just appearing', async () => {
+      const { game, player, session } = await table()
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+      const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+
+      const order = await game.order(session, ORIGIN, 'glove')
+      await coins.transfer(order.to, order.price + 5)
+      await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
+      await until(async () => (game.purchases(session, ORIGIN).at(-1)?.returned ?? 0) > 0, 'the change to be recorded')
+
+      const receipt = game.purchases(session, ORIGIN).at(-1)!
+      expect(receipt).toMatchObject({ state: 'delivered', paid: 25, returned: 5 })
+      expect(purchaseMessage(receipt)).toBe('The Springy Glove arrived. 5 coins came back as change.')
+    }, 30_000)
+
+    test('coins the shop was not expecting are accounted for too', async () => {
+      const { game, player, session } = await table()
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+
+      // A transfer against no order at all. It comes back, and saying so is the
+      // difference between a refund and coins that left and returned in silence.
+      await coins.transfer(game.address, 10)
+      await until(
+        async () => game.purchases(session, ORIGIN).some((receipt) => receipt.state === 'returned'),
+        'the unmatched payment to be recorded',
+      )
+
+      const receipt = game.purchases(session, ORIGIN).at(-1)!
+      expect(receipt).toMatchObject({ state: 'returned', returned: 10 })
+      expect(purchaseMessage(receipt)).toBe('Your 10 coins came back: the shop had no open order for it.')
+    }, 30_000)
+
+    test('the answer outlives the order, so a reloaded page can still ask for it', async () => {
+      const { game, player, session } = await table()
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+      const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
+
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+      const order = await game.order(session, ORIGIN, 'glove')
+      await coins.transfer(order.to, order.price)
+      await until(async () => (await player.items.owner(glove.asset)) === player.address, 'the glove to arrive')
+
+      // The order record is deleted on delivery. A browser that was reloaded
+      // mid-purchase has neither the order nor the message, and is asking on the
+      // strength of its wallet alone — which is what this answers to.
+      const reopened = await open(game, player)
+      await until(
+        async () => game.purchases(reopened, ORIGIN).at(-1)?.state === 'delivered',
+        'the new session to be told how it ended',
+      )
+      expect(game.purchases(reopened, ORIGIN).at(-1)!.id).toBe(order.id)
+    }, 30_000)
+
+    test('a receipt is answered to the wallet that paid and to no other', async () => {
+      const { game, player, node, session } = await table()
+      const catalogue = game.catalogue()
+      const coins = await player.token(catalogue.coin.asset)
+
+      press(game, session, 400)
+      await player.claims.add(await bank(game, session))
+      const order = await game.order(session, ORIGIN, 'glove')
+      await coins.transfer(order.to, order.price)
+      await until(
+        async () => game.purchases(session, ORIGIN).at(-1)?.state === 'delivered',
+        'the shop to say it delivered',
+      )
+
+      // Somebody else's session is not a way to read what this wallet bought.
+      const { player: other } = await join(node)
+      running.push(other)
+      expect(game.purchases(await open(game, other), ORIGIN)).toEqual([])
+    }, 30_000)
+  })
 
   test('the shop does not sell things it does not sell', async () => {
     const { game, session } = await table()
