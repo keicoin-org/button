@@ -49,7 +49,7 @@ therefore shows three deliberately different figures:
 | stage | what it means |
 |---|---|
 | `unbanked` | pressed for, counted by this browser, the server has not been asked yet |
-| `banking` | the server is pricing them; no proof back |
+| `banking` | the server is pricing them; no proof back. A batch whose answer was lost stays here rather than going back to `unbanked`, because the server may already have published a root for it — the browser retries it under the same batch id until it has the proof or the server says it signed nothing |
 | `settling` | on their way: something is out that the chain is expected to pay out — a signed proof waiting on this wallet's claim, or a payment waiting on the issuer's mint |
 | `confirmed` | accepted chain state (SPEC §5.5) — the balance, and the only spendable figure |
 
