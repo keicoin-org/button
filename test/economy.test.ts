@@ -15,7 +15,7 @@ import { Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode }
 
 import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
 import { startGame } from '../server/game.js'
-import { ORIGIN, join, kill, open, press, table as freshTable, until } from './support.js'
+import { ORIGIN, batchName, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
 
@@ -62,7 +62,7 @@ describe('pressing', () => {
     const coins = await player.token(game.catalogue().coin.asset)
 
     press(game, session, 12)
-    const bundle = await game.bank(session, ORIGIN)
+    const bundle = await game.bank(session, ORIGIN, batchName())
     expect(bundle.root).toMatch(/^[0-9A-F]{64}$/)
 
     await player.claims.add(bundle)
@@ -78,7 +78,7 @@ describe('pressing', () => {
     const sessions = await Promise.all(players.map((player) => open(game, player)))
     sessions.forEach((session, index) => press(game, session, (index + 1) * 5))
 
-    const bundles = await Promise.all(sessions.map((session) => game.bank(session, ORIGIN)))
+    const bundles = await Promise.all(sessions.map((session) => game.bank(session, ORIGIN, batchName())))
     expect(new Set(bundles.map((bundle) => bundle.root)).size).toBe(1)
 
     await Promise.all(players.map((player, index) => player.claims.add(bundles[index]!)))
@@ -95,7 +95,10 @@ describe('pressing', () => {
     // The tally is taken synchronously, so the first bank takes all ten and the
     // second finds nothing left. A second leaf here would be the same presses
     // paid for twice.
-    const [first, second] = await Promise.allSettled([game.bank(session, ORIGIN), game.bank(session, ORIGIN)])
+    const [first, second] = await Promise.allSettled([
+      game.bank(session, ORIGIN, batchName()),
+      game.bank(session, ORIGIN, batchName()),
+    ])
     expect(first.status).toBe('fulfilled')
     expect(second.status).toBe('rejected')
 
@@ -103,9 +106,43 @@ describe('pressing', () => {
     expect(await coins.balance()).toBe(10)
   }, 20_000)
 
+  test('two banks under one name join one attempt instead of starting two', async () => {
+    const { game, player, session } = await table()
+    const coins = await player.token(game.catalogue().coin.asset)
+
+    press(game, session, 10)
+    // A client that gave up waiting and asked again while the first request was
+    // still running. Both are the same batch, so both are answered by it — and
+    // the second must not find the tally emptied and be told there was nothing.
+    const batch = batchName()
+    const [first, second] = await Promise.all([
+      game.bank(session, ORIGIN, batch),
+      game.bank(session, ORIGIN, batch),
+    ])
+    expect(second.root).toBe(first.root)
+    expect(second).toEqual(first)
+
+    await player.claims.add(first)
+    expect(await coins.balance()).toBe(10)
+  }, 20_000)
+
+  test('a batch forgotten by a failed attempt can be banked again under the same name', async () => {
+    const { game, player, session } = await table()
+    const coins = await player.token(game.catalogue().coin.asset)
+
+    // Nothing observed, so this attempt is refused before anything is published.
+    const batch = batchName()
+    await expect(game.bank(session, ORIGIN, batch)).rejects.toThrow('has not seen any presses from you yet')
+
+    // The same name is still honest, because it never bought anything.
+    press(game, session, 7)
+    await player.claims.add(await game.bank(session, ORIGIN, batch))
+    expect(await coins.balance()).toBe(7)
+  }, 20_000)
+
   test('banking before this server watched anything is a sentence, not a block', async () => {
     const { game, session } = await table()
-    await expect(game.bank(session, ORIGIN)).rejects.toThrow('has not seen any presses from you yet')
+    await expect(game.bank(session, ORIGIN, batchName())).rejects.toThrow('has not seen any presses from you yet')
   }, 20_000)
 })
 
@@ -123,7 +160,7 @@ describe('the shop', () => {
     const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
 
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     expect(await coins.balance()).toBeGreaterThanOrEqual(glove.price)
 
     const order = await game.order(session, ORIGIN, 'glove')
@@ -143,14 +180,14 @@ describe('the shop', () => {
     const knuckle = catalogue.upgrades.find((upgrade) => upgrade.sku === 'knuckle')!
 
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     const order = await game.order(session, ORIGIN, 'knuckle')
     await coins.transfer(order.to, order.price)
     await until(async () => (await player.items.owner(knuckle.asset)) === player.address, 'the knuckle to arrive')
 
     const before = await coins.balance()
     press(game, session, 10)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     // +4 a press, and the server worked that out by reading the player's holdings.
     expect((await coins.balance()) - before).toBe(50)
   }, 30_000)
@@ -162,7 +199,7 @@ describe('the shop', () => {
     const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
 
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     const supplyBefore = Number((await coins.info()).circulating)
 
     const order = await game.order(session, ORIGIN, 'glove')
@@ -193,9 +230,9 @@ describe('the shop', () => {
 
     // Both players can afford it. Only one of them can own it.
     press(game, session, cap.price)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     press(game, theirSession, cap.price)
-    await second.claims.add(await game.bank(theirSession, ORIGIN))
+    await second.claims.add(await game.bank(theirSession, ORIGIN, batchName()))
 
     const order = await game.order(session, ORIGIN, 'cap')
     await mine.transfer(order.to, order.price)
@@ -219,9 +256,9 @@ describe('the shop', () => {
     running.push(second)
     const theirSession = await open(game, second)
     press(game, session, cap.price)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     press(game, theirSession, cap.price)
-    await second.claims.add(await game.bank(theirSession, ORIGIN))
+    await second.claims.add(await game.bank(theirSession, ORIGIN, batchName()))
 
     // Neither has paid, so the chain still says one is unsold. Reading the supply
     // and then taking the order as two steps is what let both of these through.
@@ -252,7 +289,7 @@ describe('the shop', () => {
 
     const session = await open(game, player)
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     const before = await coins.balance()
 
     const order = await game.order(session, ORIGIN, 'glove')
@@ -268,7 +305,7 @@ describe('the shop', () => {
     const knuckle = catalogue.upgrades.find((upgrade) => upgrade.sku === 'knuckle')!
 
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     const before = await coins.balance()
 
     // What a player who re-clicked a dearer row mid-transfer sends: the amount for
@@ -290,7 +327,7 @@ describe('the shop', () => {
     const glove = catalogue.upgrades.find((upgrade) => upgrade.sku === 'glove')!
 
     press(game, session, 400)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     const before = await coins.balance()
 
     const order = await game.order(session, ORIGIN, 'glove')
@@ -353,7 +390,7 @@ describe('the exchange desk', () => {
 
     // The loop that matters is untouched: pressing still pays (SPEC §8).
     press(game, session, 9)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     expect(await coins.balance()).toBe(9)
   }, 30_000)
 })

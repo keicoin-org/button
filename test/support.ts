@@ -61,6 +61,14 @@ export async function open(game: Game, player: Kei, origin = ORIGIN): Promise<st
   return (await game.authenticate(proof, origin)).id
 }
 
+/**
+ * A fresh name for a batch, as the browser mints one per batch.
+ *
+ * Tests that are not about retrying call this once per bank, which is what a
+ * client that never loses a response does.
+ */
+export const batchName = (): string => crypto.randomUUID()
+
 /** Press `times` times, one observed request each, exactly as the client does. */
 export function press(game: Game, session: string, times: number, origin = ORIGIN): void {
   for (let index = 0; index < times; index++) game.press(session, origin)

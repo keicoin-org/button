@@ -296,6 +296,24 @@ export async function connect(): Promise<Economy> {
    */
   let inFlight = false
 
+  /**
+   * The name of the batch currently being banked, held across its retries.
+   *
+   * A bank is not safe to simply repeat. By the time the server can answer it
+   * has already emptied the tally it was paid for and put the entitlement in a
+   * block, and the proof that collects that entitlement exists only in the
+   * response — so a response lost on the way back is coins committed on the
+   * chain that nothing can ever claim. Naming the attempt is what lets the same
+   * attempt be asked for again: the server answers a repeat with the proof it
+   * already published rather than publishing a second one.
+   *
+   * It is minted once per batch and kept until that batch is home, which is why
+   * it is out here rather than inside `runBank`. Cleared on success, so the next
+   * batch is a new one; kept on failure, so the next try is this one again.
+   */
+  let batch: string | null = null
+  const nameBatch = (): string => (batch ??= crypto.randomUUID())
+
   /** A bundle's amount is raw units; every other figure in this file is display units. */
   const paid = (bundle: ClaimBundle): number =>
     Number(bundle.amount) / 10 ** catalogue.coin.decimals
@@ -316,22 +334,34 @@ export async function connect(): Promise<Economy> {
 
     await settled()
 
+    const named = nameBatch()
+
     let bundle: ClaimBundle
     try {
       // No count goes out. The server pays for the presses it watched arrive,
       // and this browser's own tally is a prediction of that figure rather than
       // an instruction — which is why the reconciliation below exists.
-      const body = await withSession((id) => post<{ bundle?: ClaimBundle }>('/game/bank', { session: id }))
+      const body = await withSession((id) =>
+        post<{ bundle?: ClaimBundle }>('/game/bank', { session: id, batch: named }),
+      )
       if (!body.bundle) throw new Error('The game server sent no proof back.')
       bundle = body.bundle
     } catch (error) {
-      // Nothing was signed, so the presses are still owed. They go back to
-      // where they were and the headline does not move.
+      // What failed may or may not have been signed — a connection refused
+      // before the request left and a response lost on the way back arrive here
+      // as the same rejection, and this side cannot tell them apart. So the
+      // presses go back to be asked for again, and the batch keeps its name:
+      // if the server did publish, the next attempt is handed that same proof
+      // instead of a second one, and if it did not, the next attempt is the
+      // first one that reaches it.
       state.unbankedPresses += presses
       state.coins = bankingFailed(state.coins, expected)
       say(error)
       return
     }
+
+    // Home. The next batch is a different batch and gets its own name.
+    batch = null
 
     // What the chain will pay, rather than what the presses were hoped to be
     // worth. The two differ whenever a press did not reach the server or was

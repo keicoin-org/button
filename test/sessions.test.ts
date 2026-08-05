@@ -21,7 +21,7 @@ import {
   type SessionRegistry,
 } from '../server/sessions.js'
 import { sign } from '../src/ownership.js'
-import { ORIGIN, join, kill, open, press, table } from './support.js'
+import { ORIGIN, batchName, join, kill, open, press, table } from './support.js'
 
 const running: Array<{ close(): void }> = []
 afterEach(() => {
@@ -134,7 +134,7 @@ describe('a session id is not an address', () => {
   test('a made-up session id buys nothing', async () => {
     const { game } = await board()
     for (const forged of ['', 'session', 'A'.repeat(64), null, 42, {}]) {
-      await expect(game.bank(forged, ORIGIN)).rejects.toThrow(SessionError)
+      await expect(game.bank(forged, ORIGIN, batchName())).rejects.toThrow(SessionError)
     }
   }, 20_000)
 
@@ -142,7 +142,7 @@ describe('a session id is not an address', () => {
     const { game, session } = await boardWithSession()
     press(game, session, 3)
     expect(() => game.press(session, 'https://evil.example')).toThrow('different origin')
-    await expect(game.bank(session, 'https://evil.example')).rejects.toThrow('different origin')
+    await expect(game.bank(session, 'https://evil.example', batchName())).rejects.toThrow('different origin')
   }, 20_000)
 
   test('one session cannot bank another session’s presses', async () => {
@@ -156,7 +156,7 @@ describe('a session id is not an address', () => {
 
     // The thief is authenticated — for their own address — and has been watched
     // doing nothing. Being a valid session is not being that session.
-    await expect(game.bank(mine, ORIGIN)).rejects.toThrow('has not seen any presses from you yet')
+    await expect(game.bank(mine, ORIGIN, batchName())).rejects.toThrow('has not seen any presses from you yet')
   }, 30_000)
 })
 
@@ -437,7 +437,7 @@ describe('machines press faster than a hand, and legitimately', () => {
     // there is no argument anywhere on the wire that says otherwise: `machines()`
     // is fed by `bank()` from `payoutFor(ownedBy(...))` and by nothing else.
     press(game, session, 10)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     expect(await coins.balance()).toBe(10)
     expect(() => {
       for (let index = 0; index < 200; index++) game.press(session, ORIGIN)
@@ -451,11 +451,11 @@ describe('the payout is what was observed', () => {
     const coins = await player.token(game.catalogue().coin.asset)
 
     press(game, session, 7)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     expect(await coins.balance()).toBe(7)
 
     // Nothing has been watched since, so there is nothing to be paid for.
-    await expect(game.bank(session, ORIGIN)).rejects.toThrow('has not seen any presses from you yet')
+    await expect(game.bank(session, ORIGIN, batchName())).rejects.toThrow('has not seen any presses from you yet')
   }, 30_000)
 
   test('presses the ceiling refused are never paid for', async () => {
@@ -472,7 +472,7 @@ describe('the payout is what was observed', () => {
     }
     expect(refused).toBeGreaterThan(150)
 
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await game.bank(session, ORIGIN, batchName()))
     // The burst, plus whatever the real clock refilled while 200 calls ran —
     // which is a fraction of a second, so a handful at five a second.
     expect(await coins.balance()).toBeGreaterThanOrEqual(10)

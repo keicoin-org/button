@@ -67,8 +67,13 @@ export interface Game {
   press(session: unknown, origin: string): PressReceipt
   /** One hit on a mob. This server decides when it died, and names the event. */
   hit(session: unknown, origin: string, mob: unknown): HitReceipt
-  /** Pay for the presses this server observed. Returns the proof to claim with (§5.5). */
-  bank(session: unknown, origin: string): Promise<ClaimBundle>
+  /**
+   * Pay for the presses this server observed. Returns the proof to claim with (§5.5).
+   *
+   * `batch` names the attempt. Asking twice under one name is asking once, which
+   * is the only thing that makes a retry after a lost response safe.
+   */
+  bank(session: unknown, origin: string, batch: unknown): Promise<ClaimBundle>
   /** Collect a kill this server recorded, by the event id the kill returned. */
   loot(session: unknown, origin: string, event: unknown): Promise<ClaimBundle>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
@@ -80,6 +85,16 @@ export interface Game {
 const MOB_DROP = 25
 /** An order nobody paid for is forgotten after this long. */
 const ORDER_TTL_MS = 120_000
+/**
+ * How long a published batch can still be fetched by its id.
+ *
+ * It is the window a client that lost the response has to come back for the
+ * proof it never received. Long enough to cover a reconnect and a page reload,
+ * short enough that this map does not turn into a second ledger.
+ */
+const BATCH_TTL_MS = 5 * 60_000
+/** Batches remembered at once. Past this the oldest is dropped and its retry refused. */
+const MAX_REMEMBERED_BATCHES = 4_096
 
 export async function startGame(options: GameOptions): Promise<Game> {
   const kei = await Kei.server({
@@ -126,6 +141,7 @@ export async function startGame(options: GameOptions): Promise<Game> {
 
   const shop = openShop(kei, coins, items)
   const drops = new DropBatch(coins, options.flushMs ?? 1_500)
+  const batches = new BatchLog(options.now ?? Date.now)
 
   // The issuer address by default, so a restarted issuer is a different room and
   // the proofs made against the old one stop authenticating anywhere.
@@ -167,26 +183,43 @@ export async function startGame(options: GameOptions): Promise<Game> {
       return sessions.hit(session, origin, mob)
     },
 
-    async bank(session, origin) {
+    async bank(session, origin, batch) {
+      const id = batchId(batch)
+      // Who is asking is settled before the batch is looked up, so a batch id is
+      // never a way to read somebody else's proof by guessing at one.
+      const asking = sessions.require(session, origin)
+
+      // Nothing is awaited between here and `batches.begin`, which is what makes
+      // the lookup and the take one step: a second request under the same id
+      // cannot get between them and sell the tally a second time.
+      const known = batches.find(id, asking.address)
+      if (known) return known
+
       // Taken synchronously, before the first `await`: two banks in flight
       // divide the tally rather than both selling it. The count is this
       // server's, and there is no argument here a caller could put a figure in.
       const { session: who, presses } = sessions.take(session, origin)
 
-      try {
-        const { perPress, pressesPerSecond } = payoutFor(await ownedBy(kei, who.address, items))
-        // The same holdings read that prices a press also says how fast this
-        // address may press: machines on the chain press faster than a hand, and
-        // the ceiling has to count them or it clips the player who bought them.
-        // This is the one place the figure comes from — the chain, never a request.
-        sessions.machines(who.address, pressesPerSecond)
-        return await drops.add(who.address, presses * perPress)
-      } catch (error) {
-        // Nothing was published, so the presses were never spent. They go back
-        // to the session that earned them and can be banked again.
-        sessions.restore(who.id, presses)
-        throw error
-      }
+      const paying = (async () => {
+        try {
+          const { perPress, pressesPerSecond } = payoutFor(await ownedBy(kei, who.address, items))
+          // The same holdings read that prices a press also says how fast this
+          // address may press: machines on the chain press faster than a hand, and
+          // the ceiling has to count them or it clips the player who bought them.
+          // This is the one place the figure comes from — the chain, never a request.
+          sessions.machines(who.address, pressesPerSecond)
+          return await drops.add(who.address, presses * perPress)
+        } catch (error) {
+          // Nothing was published, so the presses were never spent. They go back
+          // to the session that earned them and can be banked again — under this
+          // same id, which is why a failed attempt is forgotten rather than
+          // remembered as an answer.
+          sessions.restore(who.id, presses)
+          throw error
+        }
+      })()
+
+      return batches.begin(id, who.address, paying)
     },
 
     async loot(session, origin, event) {
@@ -280,9 +313,27 @@ class DropBatch {
     }
   }
 
+  /**
+   * Stop, and tell whoever is waiting that they were stopped.
+   *
+   * Clearing the timer alone left every `add()` promise pending forever, so a
+   * bank in flight when `server/main.ts` handles SIGINT never settled: its
+   * caller hung, `bank()`'s catch never ran, and the presses it had taken were
+   * gone without anything having been published. Rejecting is the honest
+   * ending — nothing reached the chain, so the presses go back and the batch id
+   * that named the attempt is free to be tried again against the next process.
+   */
   close(): void {
     if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
+
+    const failures = this.failures
+    this.pending = new Map()
+    this.waiting = new Map()
+    this.failures = new Map()
+    for (const [, rejects] of failures) {
+      for (const reject of rejects) reject(new GameError('The game server is shutting down. Nothing was banked.'))
+    }
   }
 }
 
@@ -290,6 +341,107 @@ function push<T>(map: Map<string, T[]>, key: string, value: T): void {
   const list = map.get(key)
   if (list) list.push(value)
   else map.set(key, [value])
+}
+
+// ------------------------------------------------------------------- batches
+
+/**
+ * Which batch a bank is, so that asking twice is asking once.
+ *
+ * `bank()` does two irreversible things before it can answer: it empties the
+ * session's observed tally, and it puts an entitlement into an issuer block that
+ * is on the chain forever. A response can be lost after both — a flaky tab, a
+ * 502 in front of the Worker, a Durable Object evicted between the commit and
+ * the reply — and `drop.proofFor(address)` existed only in that response. A root
+ * cannot be turned back into a bundle, and this server keeps no handle on the
+ * drop, so the coins sit committed and unclaimable for as long as the chain
+ * lasts: permanent state on every node, one root per lost response, and a player
+ * short the presses they made.
+ *
+ * So the caller names the attempt and this remembers what that name bought. A
+ * retry under the same id is handed the same proof and publishes no second root.
+ *
+ * A batch is remembered for `BATCH_TTL_MS` and no longer, which is the honest
+ * limit of it: past that a retry is answered as a new batch — worth nothing,
+ * because the tally it would have sold is already spent — rather than answered
+ * wrongly, and this map never becomes a second ledger of who is owed what.
+ */
+class BatchLog {
+  private open = new Map<string, { address: string; bundle: Promise<ClaimBundle> }>()
+  private published = new Map<string, { address: string; bundle: ClaimBundle; at: number }>()
+
+  constructor(private readonly now: () => number) {}
+
+  /** What this id already bought, or nothing if it has bought nothing yet. */
+  find(id: string, address: string): Promise<ClaimBundle> | undefined {
+    this.forget()
+
+    const done = this.published.get(id)
+    if (done) return Promise.resolve(mine(done.address, address, done.bundle))
+
+    // An attempt still in flight is joined rather than started again, so a
+    // client that gave up waiting and asked again gets the first one's answer.
+    const running = this.open.get(id)
+    if (running) return mine(running.address, address, running.bundle)
+
+    return undefined
+  }
+
+  /** Record an attempt, and remember its proof if it publishes one. */
+  begin(id: string, address: string, paying: Promise<ClaimBundle>): Promise<ClaimBundle> {
+    this.open.set(id, { address, bundle: paying })
+    return paying.then(
+      (bundle) => {
+        this.open.delete(id)
+        if (this.published.size >= MAX_REMEMBERED_BATCHES) {
+          // Insertion order is publication order, so the first key is the oldest.
+          const oldest = this.published.keys().next()
+          if (!oldest.done) this.published.delete(oldest.value)
+        }
+        this.published.set(id, { address, bundle, at: this.now() })
+        return bundle
+      },
+      (error: unknown) => {
+        // Nothing was published under this id, so nothing is remembered under it.
+        // The presses went back to the session and the same id may be sent again,
+        // which is what makes the client's next attempt the *same* batch.
+        this.open.delete(id)
+        throw error
+      },
+    )
+  }
+
+  private forget(): void {
+    const at = this.now()
+    for (const [id, batch] of this.published) {
+      if (at - batch.at > BATCH_TTL_MS) this.published.delete(id)
+    }
+  }
+}
+
+/** A batch answers to the address that opened it and to no other. */
+function mine<T>(owner: string, asking: string, value: T): T {
+  if (owner !== asking) throw new GameError('That batch was opened by a different wallet.')
+  return value
+}
+
+/**
+ * A batch id off the wire.
+ *
+ * Required, and not optional, because the party that would decide whether to
+ * send one is the browser and the guarantee is worth nothing if the browser can
+ * opt out. Refusing a bank that does not name itself is the cheap failure; the
+ * expensive one is a proof that can never be asked for again.
+ */
+function batchId(value: unknown): string {
+  const id = typeof value === 'string' ? value.trim() : ''
+  if (id.length === 0) {
+    throw new GameError('A bank names the batch it is paying for. Send a batch id, and send the same one if you retry.')
+  }
+  if (id.length > 64 || !/^[A-Za-z0-9._-]+$/.test(id)) {
+    throw new GameError('A batch id is up to 64 letters, digits, ".", "_" or "-".')
+  }
+  return id
 }
 
 // ---------------------------------------------------------------------- shop

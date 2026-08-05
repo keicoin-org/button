@@ -66,8 +66,8 @@ export async function handleGameApi(game: Game, path: string, request: Request):
       }
 
       case '/game/bank': {
-        const { session } = await body<{ session: unknown }>(request)
-        return json({ bundle: await game.bank(session, origin) })
+        const { session, batch } = await body<{ session: unknown; batch: unknown }>(request)
+        return json({ bundle: await game.bank(session, origin, batch) })
       }
 
       case '/game/loot': {
