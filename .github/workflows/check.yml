@@ -1,0 +1,32 @@
+name: check
+
+# `test/economy.test.ts` is where this demo's claim about money is either true or
+# a README sentence: bank, claim, buy, deliver, and the ceiling on a press rate
+# the client is trusted to count. It runs against the same in-memory chain the
+# game runs against, so it is worth running on every push rather than being the
+# thing somebody remembers to run before a merge.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: typecheck
+        run: bun run typecheck
+
+      - name: test
+        run: bun test
+
+      - name: the client still exports to static files
+        run: bun run build:site
