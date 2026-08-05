@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Kei, randomSeed } from 'kei-transaction'
 import { startGame, type Game } from '../server/game.js'
-import { ORIGIN, kill, open as openSession, press } from './support.js'
+import { ORIGIN, bank, kill, open as openSession, press } from './support.js'
 
 const nodeUrl = process.env.KEI_NODE_URL
 const running: Array<{ close(): void }> = []
@@ -41,7 +41,7 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
     const cap = catalogue.upgrades.find((upgrade) => upgrade.sku === 'cap')!
     expect(await (await player.token(cap.asset)).info()).toMatchObject({ maxSupply: '1' })
     press(game, session, cap.price)
-    await player.claims.add(await game.bank(session, ORIGIN))
+    await player.claims.add(await bank(game, session))
     const order = await game.order(session, ORIGIN, cap.sku)
     await coins.transfer(order.to, order.price)
     await until(async () => (await player.items.owner(cap.asset)) === player.address, 'native item delivery')

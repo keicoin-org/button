@@ -49,7 +49,7 @@ therefore shows three deliberately different figures:
 | stage | what it means |
 |---|---|
 | `unbanked` | pressed for, counted by this browser, the server has not been asked yet |
-| `banking` | the server is pricing them; no proof back |
+| `banking` | the server is pricing them; no proof back. A batch whose answer was lost stays here rather than going back to `unbanked`, because the server may already have published a root for it — the browser retries it under the same batch id until it has the proof or the server says it signed nothing |
 | `settling` | on their way: something is out that the chain is expected to pay out — a signed proof waiting on this wallet's claim, or a payment waiting on the issuer's mint |
 | `confirmed` | accepted chain state (SPEC §5.5) — the balance, and the only spendable figure |
 
@@ -76,6 +76,22 @@ So presses are batched, and every player who banked in the same window ends up i
 account, in parallel, with no contention (SPEC §5.5). With one player it is a
 batch of one and the code is identical, which is the property that matters: this
 does not need rewriting when there are a thousand.
+
+### Why a bank carries a batch id
+
+Banking empties the press tally and publishes an issuer block, and both are done
+before the response is written. So a response lost after that — a dropped
+connection, a gateway's own error page, an eviction between the commit and the
+reply — leaves the player paid and unable to collect, because the proof is the
+only route to the coins and it went with the response.
+
+The client therefore names each attempt, and reuses that name when it retries.
+The server answers a name it has already published with the proof it published,
+so a retry recovers the first payout instead of buying a second one, and no
+second root is minted for presses that were already paid for. Retries are only
+safe to make when the two failures can be told apart, so `post()` distinguishes
+a refusal the game *sent* — nothing was signed, start again — from a failure
+that says nothing about what the game did.
 
 ### Why buying takes two signatures
 

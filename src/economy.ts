@@ -110,6 +110,22 @@ const BANK_AFTER_MS = 3_000
 const base = location.pathname.replace(/\/$/, '')
 const at = (path: string): string => `${base}${path}`
 
+/**
+ * The game answered, and the answer was no.
+ *
+ * Worth telling apart from every other failure in exactly one place — a bank.
+ * A refusal is the game itself declining a request it read, so nothing was
+ * signed for it. A dropped connection, a gateway's own error page, or a
+ * response lost on the way back say nothing at all about what the game did, and
+ * treating those as "nothing happened" is how a player is paid twice for the
+ * same presses or never paid for them at all.
+ *
+ * A 5xx carrying a sentence is deliberately *not* one of these: the game meant
+ * to answer and something in it broke part-way, which is precisely the case
+ * where what it managed to do first is unknown.
+ */
+class Refusal extends Error {}
+
 /** POST JSON and read the answer, with the server's own sentence on a refusal. */
 async function post<T>(path: string, payload: unknown): Promise<T> {
   const response = await fetch(at(path), {
@@ -117,12 +133,29 @@ async function post<T>(path: string, payload: unknown): Promise<T> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   })
-  const body = (await response.json()) as T & { error?: string }
+  let body: T & { error?: string }
+  try {
+    body = (await response.json()) as T & { error?: string }
+  } catch {
+    // Not JSON, so it did not come from the game: a proxy, a gateway, or a
+    // connection that ended mid-answer. Whatever the game did with the request
+    // cannot be read off this.
+    throw new Error(`The game server answered ${response.status} and not JSON.`)
+  }
   // SPEC §6.1: the server's refusals are sentences that state their own fix, so
   // they are surfaced as written rather than replaced with a status code.
-  if (body.error) throw new Error(body.error)
+  if (body.error) throw response.status >= 500 ? new Error(body.error) : new Refusal(body.error)
   return body
 }
+
+/**
+ * Names one bank attempt, so a retry can say which one it is retrying.
+ *
+ * Generated when a batch starts and kept until that batch is settled — a new id
+ * per attempt would make every retry a fresh batch, which is the whole bug.
+ */
+const newBatchId = (): string =>
+  crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 
 export async function connect(): Promise<Economy> {
   const listeners: Array<(state: EconomyState) => void> = []
@@ -301,37 +334,70 @@ export async function connect(): Promise<Economy> {
     Number(bundle.amount) / 10 ** catalogue.coin.decimals
 
   /**
+   * The batch that is out, if one is.
+   *
+   * It outlives a failed attempt on purpose. A bank consumes the server's press
+   * tally and publishes an issuer block before the response is written, so a
+   * response that never arrives leaves those presses paid for and their proof
+   * unfetched — and the id here is the only thing that can ask for it again.
+   */
+  let batch: { id: string; presses: number; expected: number } | undefined
+
+  /**
    * Ask the game to price a batch, take the proof, write the claim.
    *
    * Only `bank()` calls this, and only one call is ever running: every stage
    * move in here assumes it is the only thing moving them.
    */
-  const runBank = async (presses: number): Promise<void> => {
-    // Both figures move together and are remembered together, because if the
-    // fetch fails they both go back.
-    const expected = state.coins.unbanked
-    state.unbankedPresses = 0
-    state.coins = bankingStarted(state.coins)
-    changed()
+  const runBank = async (): Promise<void> => {
+    if (batch === undefined) {
+      // Both figures move together and are remembered together, and they are
+      // remembered *with the id*: if this has to be retried it is retried as
+      // itself — these presses, this expectation — rather than as a new batch
+      // for whatever has been pressed since.
+      batch = { id: newBatchId(), presses: state.unbankedPresses, expected: state.coins.unbanked }
+      state.unbankedPresses = 0
+      state.coins = bankingStarted(state.coins)
+      changed()
 
-    await settled()
+      await settled()
+    }
+    const { id: batchId, presses, expected } = batch
 
     let bundle: ClaimBundle
     try {
       // No count goes out. The server pays for the presses it watched arrive,
       // and this browser's own tally is a prediction of that figure rather than
-      // an instruction — which is why the reconciliation below exists.
-      const body = await withSession((id) => post<{ bundle?: ClaimBundle }>('/game/bank', { session: id }))
+      // an instruction — which is why the reconciliation below exists. The batch
+      // id is the one thing this file names, and it buys nothing: it says which
+      // payout is being asked for, so asking twice cannot buy two.
+      const body = await withSession((id) =>
+        post<{ bundle?: ClaimBundle }>('/game/bank', { session: id, batch: batchId }),
+      )
       if (!body.bundle) throw new Error('The game server sent no proof back.')
       bundle = body.bundle
     } catch (error) {
-      // Nothing was signed, so the presses are still owed. They go back to
-      // where they were and the headline does not move.
+      if (!(error instanceof Refusal)) {
+        // Nobody knows what happened, so nothing is decided here. The coins stay
+        // in `banking`, which is the stage that means exactly that, and the next
+        // attempt sends *this* id again: if the game published a root for it, the
+        // retry is handed that proof, and if it did not, the retry buys the first
+        // one. The premise this replaces — that a failed fetch means nothing was
+        // signed — is false for every response lost after the commit block lands.
+        say(error)
+        timer ??= setTimeout(() => void bank(), BANK_AFTER_MS)
+        return
+      }
+      // The game answered, and the answer was that it signed nothing. The
+      // presses are still owed, they go back to where they were, the headline
+      // does not move, and the batch is over.
+      batch = undefined
       state.unbankedPresses += presses
       state.coins = bankingFailed(state.coins, expected)
       say(error)
       return
     }
+    batch = undefined
 
     // What the chain will pay, rather than what the presses were hoped to be
     // worth. The two differ whenever a press did not reach the server or was
@@ -384,13 +450,16 @@ export async function connect(): Promise<Economy> {
       timer = setTimeout(() => void bank(), BANK_AFTER_MS)
       return
     }
-    const presses = state.unbankedPresses
-    if (presses <= 0) return
+    // A batch whose answer never arrived is finished before anything new is
+    // started, and it is finished even with nothing pressed since: it is holding
+    // presses the game may already have paid for, and the proof for them is
+    // reachable only by asking for that batch again.
+    if (batch === undefined && state.unbankedPresses <= 0) return
 
     inFlight = true
     state.banking = true
     try {
-      await runBank(presses)
+      await runBank()
     } finally {
       inFlight = false
       state.banking = false
