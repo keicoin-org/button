@@ -372,10 +372,10 @@ function openShop(
    * Honour one settled payment, or give it back.
    *
    * Awaited by nothing — the arrival comes from a chain subscription, not from a
-   * request — so `close`'s handler below is the only thing between a failed mint
-   * and Node's default for an unhandled rejection, which is to take the whole
-   * game server down over one purchase. That is the same hazard, and the same
-   * fix, as world-of-wonder's `dropCTRL.ts`.
+   * request — so the `.catch` on the call below is the only thing between a
+   * failed mint and Node's default for an unhandled rejection, which is to take
+   * the whole game server down over one purchase. That is the same hazard, and
+   * the same fix, as world-of-wonder's `dropCTRL.ts`.
    */
   const settle = async (from: string, paid: bigint): Promise<void> => {
     const order = orders.get(from)
@@ -497,7 +497,7 @@ function soldOut(upgrade: { name: string; supply: number }, unsold: bigint): str
   }
   const only =
     upgrade.supply === 1
-      ? `There is only one on this network and it is owned.`
+      ? 'There is only one on this network and it is owned.'
       : `All ${upgrade.supply} have been bought.`
   return `The ${upgrade.name} is sold out. ${only} Nothing was charged.`
 }
