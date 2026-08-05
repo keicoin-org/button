@@ -15,7 +15,8 @@
 
 import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
 
-import { GameError, startGame } from './game.js'
+import { handleGameApi } from './api.js'
+import { startGame } from './game.js'
 
 /** Native, and with a trailing separator — `pathname` would hand Windows `/C:/…`. */
 const root = Bun.fileURLToPath(new URL('..', import.meta.url))
@@ -46,18 +47,16 @@ const game = await startGame({
   exchange,
 })
 
-const json = (body: unknown, status = 200): Response =>
-  Response.json(body, { status, headers: { 'access-control-allow-origin': '*' } })
-
-const failed = (error: unknown): Response =>
-  json({ error: error instanceof Error ? error.message : String(error) }, error instanceof GameError ? 400 : 500)
-
-async function read<T>(request: Request): Promise<T> {
-  try {
-    return (await request.json()) as T
-  } catch {
-    throw new GameError('That request was not JSON.')
-  }
+/**
+ * Development convenience, and only that: a client served from somewhere else
+ * can still reach this server. It is not a permission — a session is bound to
+ * the origin its challenge was issued to, so a page on another origin gets its
+ * own session or none.
+ */
+const cors = (response: Response): Response => {
+  response.headers.set('access-control-allow-origin', '*')
+  response.headers.set('access-control-allow-headers', 'content-type')
+  return response
 }
 
 const server = Bun.serve({
@@ -79,39 +78,14 @@ const server = Bun.serve({
 
     '/rpc': { POST: rpc, OPTIONS: rpc },
 
-    '/game/catalogue': () => json(game.catalogue()),
-
-    '/game/bank': {
-      async POST(request) {
-        try {
-          const { address, presses } = await read<{ address: string; presses: number }>(request)
-          return json({ bundle: await game.bank(address, presses) })
-        } catch (error) {
-          return failed(error)
-        }
-      },
-    },
-
-    '/game/order': {
-      async POST(request) {
-        try {
-          const { address, sku } = await read<{ address: string; sku: string }>(request)
-          return json(await game.order(address, sku))
-        } catch (error) {
-          return failed(error)
-        }
-      },
-    },
-
-    '/game/loot': {
-      async POST(request) {
-        try {
-          const { address, mob } = await read<{ address: string; mob: string }>(request)
-          return json({ bundle: await game.loot(address, mob) })
-        } catch (error) {
-          return failed(error)
-        }
-      },
+    // One handler, shared with the deployed Worker (`server/api.ts`). Adding a
+    // route here and not there is what left the Worker trusting a client's own
+    // press count after the same hole was known about locally.
+    '/game/*': async (request) => {
+      if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }))
+      const path = new URL(request.url).pathname
+      const response = await handleGameApi(game, path, request)
+      return cors(response ?? new Response('Not found', { status: 404 }))
     },
   },
 })

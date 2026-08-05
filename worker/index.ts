@@ -18,7 +18,8 @@
 import { DurableObject } from 'cloudflare:workers'
 import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
 
-import { GameError, startGame, type Game } from '../server/game.js'
+import { startGame, type Game } from '../server/game.js'
+import { apiPath, handleArenaRequest } from './router.js'
 
 interface Env {
   ASSETS: Fetcher
@@ -27,14 +28,6 @@ interface Env {
   KEI_GAME_SEED?: string
   /** Set to 'off' to run the demo with payments disabled (SPEC §8). */
   BUTTON_EXCHANGE?: string
-}
-
-/** Everything under the mount point that is not a static file. */
-const MOUNT = '/examples/button'
-
-function apiPath(url: URL): string | null {
-  const path = url.pathname.startsWith(MOUNT) ? url.pathname.slice(MOUNT.length) : url.pathname
-  return path === '/rpc' || path.startsWith('/game/') ? path : null
 }
 
 export class Arena extends DurableObject<Env> {
@@ -56,41 +49,8 @@ export class Arena extends DurableObject<Env> {
   }
 
   override async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url)
-    const path = apiPath(url)
-    if (!path) return new Response('Not found', { status: 404 })
-
     const { game, rpc } = await this.#ready()
-
-    if (path === '/rpc') return rpc(request)
-
-    try {
-      switch (path) {
-        case '/game/catalogue':
-          return json(game.catalogue())
-
-        case '/game/bank': {
-          const { address, presses } = await body<{ address: string; presses: number }>(request)
-          return json({ bundle: await game.bank(address, presses) })
-        }
-
-        case '/game/order': {
-          const { address, sku } = await body<{ address: string; sku: string }>(request)
-          return json(await game.order(address, sku))
-        }
-
-        case '/game/loot': {
-          const { address, mob } = await body<{ address: string; mob: string }>(request)
-          return json({ bundle: await game.loot(address, mob) })
-        }
-
-        default:
-          return new Response('Not found', { status: 404 })
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return json({ error: message }, error instanceof GameError ? 400 : 500)
-    }
+    return handleArenaRequest(game, rpc, request)
   }
 }
 
@@ -106,15 +66,3 @@ export default {
     return env.ASSETS.fetch(request)
   },
 } satisfies ExportedHandler<Env>
-
-function json(value: unknown, status = 200): Response {
-  return Response.json(value, { status })
-}
-
-async function body<T>(request: Request): Promise<T> {
-  try {
-    return (await request.json()) as T
-  } catch {
-    throw new GameError('That request was not JSON.')
-  }
-}
