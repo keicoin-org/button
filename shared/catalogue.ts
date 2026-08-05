@@ -87,6 +87,17 @@ export function upgradeBySku(sku: string): Upgrade | undefined {
   return UPGRADES.find((upgrade) => upgrade.sku === sku)
 }
 
+/**
+ * How many assets this game issues at startup: the coin, and one item type per
+ * upgrade.
+ *
+ * Counted off the list rather than written down, because the list is the thing
+ * that changes. Issuance is the one operation in Kei that costs Kei, and what it
+ * costs depends on how many an account has issued already (SPEC §5.6.5) — so a
+ * literal here is a number that goes wrong the moment somebody adds a row above.
+ */
+export const ISSUED_ASSETS = 1 + UPGRADES.length
+
 export interface Payout {
   /** Coins earned by one press. */
   perPress: number

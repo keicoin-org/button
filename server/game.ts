@@ -14,13 +14,14 @@
  * server watched them do.
  */
 
-import { Kei, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
+import { Kei, KEI_DECIMALS, issuanceBurn, type ClaimBundle, type IssuerToken, type Item } from 'kei-transaction'
 import type { KeiNode } from 'kei-transaction'
 
 import type { OwnershipChallengeMessage } from '../shared/ownership.js'
 import {
   COIN,
   COINS_PER_KEI,
+  ISSUED_ASSETS,
   MINIMUM_TOP_UP,
   UPGRADES,
   payoutFor,
@@ -81,6 +82,43 @@ const MOB_DROP = 25
 /** An order nobody paid for is forgotten after this long. */
 const ORDER_TTL_MS = 120_000
 
+/** Raw units in one Kei. Every issuance burn is a whole number of them. */
+const RAW_PER_KEI = 10n ** BigInt(KEI_DECIMALS)
+
+/**
+ * What issuing this game's assets burns, in Kei.
+ *
+ * The n-th asset an account issues burns **n** Kei (SPEC §5.6.5), so the cost of
+ * a catalogue is triangular and there is no per-asset constant to multiply by.
+ * `issuanceBurn` is the chain's own function for the rule; summing it over the
+ * assets this game issues is the only figure that stays right when a row is
+ * added to `UPGRADES` or the rule moves again.
+ *
+ * Six assets is 1+2+3+4+5+6 = 21 Kei. It is worth being exact about, because
+ * this file used to size its faucet against a flat 1,000 Kei per asset — a rule
+ * §5.6.5 describes as the one the n-Kei rule *replaced* — and asked for 6,100.
+ * This is an example repository and its arithmetic gets copied.
+ */
+export function startupBurn(assets: number = ISSUED_ASSETS): number {
+  let raw = 0n
+  for (let issued = 0; issued < assets; issued++) raw += issuanceBurn(issued)
+  // Rounded up, because this is what has to be covered rather than what is spent.
+  return Number((raw + RAW_PER_KEI - 1n) / RAW_PER_KEI)
+}
+
+/**
+ * Slack over the burn, for a rule that moves before this code does.
+ *
+ * The issuer pays for nothing else: minting, committing and burning are all free
+ * (SPEC §5.6.5), so this is a margin rather than a budget. It is deliberately
+ * larger than the burn — 21 Kei is small enough that the honest way to be safe
+ * is a flat cushion, not a multiplier nobody can check.
+ */
+export const FAUCET_HEADROOM = 100
+
+/** What the issuer asks the faucet for, derived rather than restated. */
+export const FAUCET_GRANT = startupBurn() + FAUCET_HEADROOM
+
 export async function startGame(options: GameOptions): Promise<Game> {
   const kei = await Kei.server({
     seed: options.seed,
@@ -88,11 +126,10 @@ export async function startGame(options: GameOptions): Promise<Game> {
     ...(options.network === undefined ? {} : { network: options.network }),
   })
 
-  // Issuance burns 1,000 Kei per asset (SPEC §5.6.5), and this game issues one
-  // currency and five upgrades. On a real network somebody funds this address
-  // once; on a mock the faucet does.
-  const needed = (UPGRADES.length + 1) * 1_000 + 100
-  if ((await kei.balance()) < needed) await kei.faucet(needed)
+  // Issuance is the one thing in Kei that costs Kei, and what the assets below
+  // burn is computed from them rather than guessed at. On a real network
+  // somebody funds this address once; on a mock the faucet does.
+  if ((await kei.balance()) < FAUCET_GRANT) await kei.faucet(FAUCET_GRANT)
 
   const coins = await kei.token.issue({
     name: COIN.name,

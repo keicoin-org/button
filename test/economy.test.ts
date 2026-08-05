@@ -13,8 +13,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Kei, MockNode, randomSeed, type Block, type ClaimBundle, type KeiNode } from 'kei-transaction'
 
-import { payoutFor, upgradeBySku } from '../shared/catalogue.js'
-import { startGame } from '../server/game.js'
+import { ISSUED_ASSETS, UPGRADES, payoutFor, upgradeBySku } from '../shared/catalogue.js'
+import { FAUCET_GRANT, FAUCET_HEADROOM, startGame, startupBurn } from '../server/game.js'
 import { ORIGIN, join, kill, open, press, table as freshTable, until } from './support.js'
 
 const running: Array<{ close(): void }> = []
@@ -369,4 +369,48 @@ describe('the price list', () => {
     expect(payoutFor({ glove: 1, cap: 1 }).perPress).toBe(4)
     expect(payoutFor({ 'auto-mk1': 2, 'auto-mk2': 1 }).pressesPerSecond).toBe(5)
   })
+})
+
+describe('what it costs the issuer to exist', () => {
+  /** Kei raw is 18 decimals; every issuance burn is a whole number of Kei. */
+  const keiHeld = async (node: KeiNode, address: string): Promise<number> =>
+    Number(BigInt((await node.accountInfo(address))!.balance) / 10n ** 18n)
+
+  test('the burn is counted off the catalogue, not written down beside it', () => {
+    // One coin plus one item type per upgrade. Adding a row to UPGRADES has to
+    // move this figure, or the grant below stops covering the assets it is for.
+    expect(ISSUED_ASSETS).toBe(1 + UPGRADES.length)
+  })
+
+  test('the n-th asset burns n Kei, so a catalogue costs a triangle', () => {
+    // Not a per-asset constant, which is the whole reason this is a function.
+    expect(startupBurn(1)).toBe(1)
+    expect(startupBurn(2)).toBe(3)
+    expect(startupBurn(3)).toBe(6)
+    expect(startupBurn(6)).toBe(21)
+    // The flat 1,000-per-asset rule SPEC §5.6.5 says this replaced would make
+    // the same six assets cost 6,000.
+    expect(startupBurn()).toBeLessThan(ISSUED_ASSETS * 1_000)
+  })
+
+  test('starting the game really burns what startupBurn says it does', async () => {
+    // Measured on the chain rather than asserted: if the burn rule moves, the
+    // grant stops matching what the issuer spent and this is what says so.
+    const { game, node } = await table()
+    const left = await keiHeld(node, game.address)
+
+    expect(FAUCET_GRANT - left).toBe(startupBurn())
+    expect((await node.accountInfo(game.address))!.issuedCount).toBe(ISSUED_ASSETS)
+  }, 30_000)
+
+  test('the grant covers the burn without being sized against a rule that was replaced', async () => {
+    const { game, node } = await table()
+    const burned = FAUCET_GRANT - (await keiHeld(node, game.address))
+
+    expect(FAUCET_GRANT).toBeGreaterThanOrEqual(burned)
+    // Slack, not a budget. A grant two orders of magnitude over the burn makes
+    // startup depend on a rate-limited faucet for no reason, and teaches the
+    // wrong number to everybody who copies this file.
+    expect(FAUCET_GRANT).toBeLessThanOrEqual(burned + FAUCET_HEADROOM)
+  }, 30_000)
 })
