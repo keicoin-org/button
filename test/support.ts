@@ -75,9 +75,13 @@ export const batchId = (): string => `batch-${++batches}`
  *
  * Pass a `batch` that has been used before to retry *that* attempt, which is
  * what a client does when it never saw the answer to the first one.
+ *
+ * Hands back the bundle alone. Most callers here only want something to claim;
+ * a test that cares about this call's own share of a merged leaf (#26) reaches
+ * `game.bank` directly for the `{ bundle, amount }` pair.
  */
-export function bank(game: Game, session: string, batch = batchId(), origin = ORIGIN): Promise<ClaimBundle> {
-  return game.bank(session, origin, batch)
+export async function bank(game: Game, session: string, batch = batchId(), origin = ORIGIN): Promise<ClaimBundle> {
+  return (await game.bank(session, origin, batch)).bundle
 }
 
 /** A whole slime, hit until this server says it is dead. Returns the event id. */

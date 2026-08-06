@@ -32,7 +32,7 @@ describe.skipIf(!nodeUrl)('Button M4 over a native node', () => {
 
     // A real rooted claim from a mob this server watched die.
     const session = await openSession(game, player)
-    await player.claims.add(await game.loot(session, ORIGIN, kill(game, session, 'slime-1')))
+    await player.claims.add((await game.loot(session, ORIGIN, kill(game, session, 'slime-1'))).bundle)
     const catalogue = game.catalogue()
     const coins = await player.token(catalogue.coin.asset)
     expect(await coins.balance()).toBe(25)

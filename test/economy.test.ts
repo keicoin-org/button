@@ -576,8 +576,9 @@ describe('mob loot', () => {
   test('a defeated mob drops a claim the player writes on their own chain', async () => {
     const { game, player, session } = await table()
     const coins = await player.token(game.catalogue().coin.asset)
-    const bundle = await game.loot(session, ORIGIN, kill(game, session, 'slime-1'))
+    const { bundle, amount } = await game.loot(session, ORIGIN, kill(game, session, 'slime-1'))
     expect(bundle.root).toMatch(/^[0-9A-F]{64}$/)
+    expect(amount).toBe(25)
     await player.claims.add(bundle)
     expect(await coins.balance()).toBe(25)
   }, 20_000)
@@ -591,6 +592,43 @@ describe('mob loot', () => {
     ])
     expect(first.status).toBe('fulfilled')
     expect(retry.status).toBe('rejected')
+  }, 20_000)
+
+  /**
+   * #26: a bank and a loot that land in the same `DropBatch` flush window are
+   * merged into one issuer leaf — correctly, per SPEC §5.5, one entitlement per
+   * account per root. What was wrong was the fan-out: both callers used to be
+   * resolved with the *whole* leaf as if it were theirs alone, so a 20-coin bank
+   * and a 25-coin kill in the same window both read 45.
+   */
+  test('a bank and a kill in the same window share one leaf, and each learns its own amount', async () => {
+    const { game, player, session } = await table()
+    const coins = await player.token(game.catalogue().coin.asset)
+
+    press(game, session, 20)
+    const event = kill(game, session, 'slime-1')
+
+    // Fired together, so both reach `DropBatch.add` inside the same flush
+    // window (`flushMs: 20`, `test/support.ts`) and are merged.
+    const [banked, looted] = await Promise.all([
+      game.bank(session, ORIGIN, batchId()),
+      game.loot(session, ORIGIN, event),
+    ])
+
+    // One leaf: the same root, and its amount is the combined total — never
+    // read directly by either caller now, which is the fix.
+    expect(looted.bundle.root).toBe(banked.bundle.root)
+    expect(banked.bundle.amount).toBe(looted.bundle.amount)
+    expect(Number(banked.bundle.amount)).toBe(45)
+
+    // Each caller's own figure is its own.
+    expect(banked.amount).toBe(20)
+    expect(looted.amount).toBe(25)
+
+    // And the leaf pays out once, in full, however many times it is submitted.
+    await player.claims.add(banked.bundle)
+    await player.claims.add(looted.bundle)
+    expect(await coins.balance()).toBe(45)
   }, 20_000)
 })
 
