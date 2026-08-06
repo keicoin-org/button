@@ -11,7 +11,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { keyPairFromSeed, randomSeed, signHash, type KeyPair } from '@keicoin/core'
 
 import { payoutFor } from '../shared/catalogue.js'
-import { ownershipChallengeHash, signOwnershipChallenge } from '../shared/ownership.js'
+import { ownershipChallengeHash, signOwnershipChallenge, type OwnershipChallengeMessage } from '../shared/ownership.js'
 import {
   DEFAULT_OBSERVATION_RATE,
   HITS_PER_MOB,
@@ -40,7 +40,15 @@ async function boardWithSession(options: Parameters<typeof table>[0] = {}) {
 }
 
 /** The registry on its own, with a clock a test can move and no chain behind it. */
-function bare(options: { now?: () => number; refillPerSecond?: number; capacity?: number } = {}): SessionRegistry {
+function bare(
+  options: {
+    now?: () => number
+    refillPerSecond?: number
+    capacity?: number
+    maxChallenges?: number
+    maxChallengesPerAddress?: number
+  } = {},
+): SessionRegistry {
   return createSessions({ room: 'kei_test_room', ...options })
 }
 
@@ -252,6 +260,68 @@ describe('an honest kill whose payout failed', () => {
     // event coming back, not a second one stacked on top of the first.
     expect(() => sessions.hit(id, ORIGIN, 'slime-1')).toThrow('already dead')
     expect(sessions.redeem(id, ORIGIN, event).mob).toBe('slime-1')
+  })
+})
+
+/**
+ * #23: the only unauthenticated door — `challenge()`, which needs no session
+ * and no signature — used to be bounded by one global map that *refused* once
+ * full. A flood that kept it full, which costs about 4,096 requests a minute
+ * against the default `CHALLENGE_TTL_MS`, refused every arrival behind it for
+ * as long as it kept up. It is now bounded two ways: past a per-address share,
+ * that address's own oldest is evicted; past the global bound, the globally
+ * oldest is evicted, whoever it belongs to. Neither refuses a fresh caller.
+ */
+describe('the challenge map does not lock out a fresh address', () => {
+  test('a flood that fills the map is evicted, not refused — a fresh address can still ask and authenticate', async () => {
+    const sessions = bare({ maxChallenges: 8, maxChallengesPerAddress: 1_000 })
+
+    // Twenty challenges, a fresh address per request — #23's own reproduction
+    // shape — against a map that holds eight. Every one of these has to
+    // succeed: `challenge()` never threw for the flood either, only a full map
+    // used to mean a refusal, and the flood is what fills it.
+    for (let flooded = 0; flooded < 20; flooded++) {
+      expect(() => sessions.challenge(`kei_attacker_${flooded}`, ORIGIN)).not.toThrow()
+    }
+
+    // A late, honest arrival is not refused for finding the map already full —
+    // the globally oldest entry of the flood was evicted to make room, not
+    // this request — and asking and signing right away still reaches a session,
+    // which is the whole of what #23 asks to be true.
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    const id = await prove(sessions, keys)
+    expect(id).toMatch(/^[0-9A-F]{64}$/)
+  })
+
+  test('one address cannot hold more than its own share of the map', async () => {
+    const sessions = bare({ maxChallenges: 4_096, maxChallengesPerAddress: 3 })
+
+    const issued: OwnershipChallengeMessage[] = []
+    for (let asked = 0; asked < 10; asked++) issued.push(sessions.challenge('kei_repeat_caller', ORIGIN))
+
+    // Only the last three are still good; asking again evicted this address's
+    // own oldest each time, never anybody else's — proven separately below by
+    // the flood test, which shares the map with nobody but itself.
+    for (const stale of issued.slice(0, -3)) {
+      await expect(
+        sessions.authenticate({ challenge: stale, signature: '0'.repeat(128) }, ORIGIN),
+      ).rejects.toThrow('never issued here')
+    }
+  })
+
+  test('flooding under one address does not touch a different address kept well under its own share', async () => {
+    // A tiny global bound, so the *only* thing standing between the flood and
+    // the honest address's four challenges is the per-address cap: if flooding
+    // one address could evict another's, this would fail.
+    const sessions = bare({ maxChallenges: 4_096, maxChallengesPerAddress: 4 })
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+
+    const mine = sessions.challenge(keys.address, ORIGIN)
+    for (let flooded = 0; flooded < 50; flooded++) sessions.challenge('kei_repeat_attacker', ORIGIN)
+
+    const proof = await signOwnershipChallenge(keys, mine)
+    const session = await sessions.authenticate(proof, ORIGIN)
+    expect(session.address).toBe(keys.address)
   })
 })
 
