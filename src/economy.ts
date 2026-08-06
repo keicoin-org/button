@@ -23,6 +23,7 @@
 import { Kei, type ClaimBundle, type PlayerToken, type WalletSummary } from 'kei-transaction'
 
 import type { OwnershipChallengeMessage } from '../shared/ownership.js'
+import { purchaseMessage, purchaseTone, type PurchaseReceipt } from '../shared/purchase.js'
 
 import {
   payoutFor,
@@ -84,7 +85,28 @@ export interface EconomyState {
   upgrades: ShopRow[]
   /** One sentence for the player. Errors from the SDK arrive here verbatim. */
   message: string | null
+  /**
+   * How that sentence should read.
+   *
+   * There is one line on the screen and three kinds of thing to say on it, and
+   * a purchase is the reason it matters: "the Springy Glove arrived" and "your
+   * 25 coins came back" are opposite outcomes, and a player who sees them in the
+   * same colour has been told almost nothing.
+   */
+  tone: NoticeTone
 }
+
+/** Good news, bad news, and news. */
+export type NoticeTone = 'note' | 'good' | 'warn'
+
+/**
+ * Who put the sentence on the screen.
+ *
+ * Only the thing that wrote a message clears it. Without that, a bank finishing
+ * — which happens every three seconds while the player is pressing — wipes the
+ * shop's answer about their money a moment after they are told it.
+ */
+type Voice = 'bank' | 'shop' | 'wallet'
 
 export interface Economy {
   readonly state: EconomyState
@@ -100,6 +122,16 @@ export interface Economy {
 /** Bank after this many presses, or this long, whichever comes first. */
 const BANK_AFTER_PRESSES = 20
 const BANK_AFTER_MS = 3_000
+
+/**
+ * How long to wait for the shop's answer, and how often to ask.
+ *
+ * A mint is a chain round trip and a refund is another, so a settled answer can
+ * be a few seconds out. Past this the player is told that it has not settled
+ * rather than told nothing, which is the difference this exists for.
+ */
+const PURCHASE_POLL_MS = 700
+const PURCHASE_TRIES = 30
 
 /**
  * Everything is addressed relative to wherever this page is served from, because
@@ -173,6 +205,7 @@ export async function connect(): Promise<Economy> {
     exchange: { open: false, coinsPerKei: 0, minimum: 0 },
     upgrades: [],
     message: null,
+    tone: 'note',
   }
 
   const changed = (): void => {
@@ -185,11 +218,25 @@ export async function connect(): Promise<Economy> {
     }
     for (const listener of listeners) listener(state)
   }
-  const say = (error: unknown): void => {
+  /** Whoever wrote what is on the screen now, so only they can take it down. */
+  let voice: Voice | null = null
+
+  const tell = (text: string | null, tone: NoticeTone, from: Voice): void => {
+    state.message = text
+    state.tone = tone
+    voice = text === null ? null : from
+    changed()
+  }
+
+  /** Take down a message this voice put up, and leave anybody else's alone. */
+  const hush = (from: Voice): void => {
+    if (voice === from) tell(null, 'note', from)
+  }
+
+  const say = (error: unknown, from: Voice = 'wallet'): void => {
     // SPEC §6.1: every error is a sentence that states its own fix, so it is
     // shown as written rather than replaced with "something went wrong".
-    state.message = error instanceof Error ? error.message : String(error)
-    changed()
+    tell(error instanceof Error ? error.message : String(error), 'warn', from)
   }
 
   let catalogue: CataloguePayload
@@ -213,6 +260,7 @@ export async function connect(): Promise<Economy> {
       error instanceof Error && !/Failed to fetch|NetworkError/.test(error.message)
         ? error.message
         : 'No game server here — presses are not being banked. Start one with: bun run dev'
+    state.tone = 'warn'
     return offline(state, listeners, changed)
   }
 
@@ -418,7 +466,10 @@ export async function connect(): Promise<Economy> {
     // the truth arrives.
     const amount = paid(bundle)
     state.coins = banked(state.coins, expected, amount)
-    state.message = null
+    // Only what banking itself had to say. The shop's answer about a purchase
+    // stays up: a bank lands every three seconds while the player is pressing,
+    // and it is not entitled to take down somebody else's sentence.
+    hush('bank')
     changed()
 
     try {
@@ -437,7 +488,7 @@ export async function connect(): Promise<Economy> {
       // come back as a rise in the chain's figure if that retry lands. Counting
       // them as clearing meanwhile would be a promise this browser cannot keep.
       state.coins = claimFailed(state.coins, amount)
-      say(error)
+      say(error, 'bank')
     }
     changed()
   }
@@ -523,6 +574,76 @@ export async function connect(): Promise<Economy> {
     changed()
   }
 
+  // ---------------------------------------------------------------- purchases
+
+  /**
+   * Ask the shop how a purchase ended, until it has ended.
+   *
+   * A purchase is the one thing in this game the player cannot watch happen: the
+   * transfer is theirs, but the delivery — or the refund — is an issuer block
+   * this browser has no part in. The chain will show the item arriving, and it
+   * shows a refund as coins going up, which is indistinguishable from any other
+   * coins going up. So the shop is asked, by order id, and the optimistic line
+   * is replaced by whichever of the two endings happened.
+   *
+   * Polling rather than a socket, because the answer has to survive a reload as
+   * well as a slow mint, and a reloaded page has no socket and no order id — but
+   * it does still have its wallet, which is what `/game/purchases` answers to.
+   */
+  const settle = async (id: string): Promise<PurchaseReceipt | null> => {
+    const body = await withSession((session) =>
+      post<{ purchases?: PurchaseReceipt[] }>('/game/purchases', { session }),
+    )
+    return body.purchases?.find((receipt) => receipt.id === id) ?? null
+  }
+
+  const follow = async (id: string): Promise<void> => {
+    for (let attempt = 0; attempt < PURCHASE_TRIES; attempt++) {
+      await new Promise((resume) => setTimeout(resume, PURCHASE_POLL_MS))
+      let receipt: PurchaseReceipt | null
+      try {
+        receipt = await settle(id)
+      } catch (error) {
+        // The shop is unreachable, which says nothing about the purchase. The
+        // coins are on the chain and the answer is still there to be asked for.
+        say(error, 'shop')
+        continue
+      }
+      // Gone from the shop's memory, which after ten minutes it will be. The
+      // player's item, if it arrived, is on the chain and in their wallet.
+      if (!receipt) break
+      if (receipt.state === 'open') continue
+      tell(purchaseMessage(receipt), purchaseTone(receipt), 'shop')
+      return
+    }
+    // Not an error and not a promise. The transfer is signed and final, the shop
+    // owes one of two endings, and this says which of those is still true.
+    tell(
+      'The shop has not said how that purchase ended yet. Your coins are on the chain either way — it will be here when it settles.',
+      'warn',
+      'shop',
+    )
+  }
+
+  /**
+   * Catch up with a purchase this page was not open for.
+   *
+   * A player who reloads mid-purchase had nothing to come back to: the message
+   * was in a closed tab and the order id with it. The shop answers to the proven
+   * wallet, so the answer survives the reload even though nothing about it did.
+   */
+  const resume = async (): Promise<void> => {
+    const body = await withSession((session) =>
+      post<{ purchases?: PurchaseReceipt[] }>('/game/purchases', { session }),
+    )
+    const latest = body.purchases?.at(-1)
+    if (!latest) return
+    if (latest.state === 'open') return void follow(latest.id)
+    tell(purchaseMessage(latest), purchaseTone(latest), 'shop')
+  }
+
+  if (session !== null) void resume().catch(() => undefined)
+
   // Auto-pressers press. They are worth exactly what a finger is worth, because
   // the payout is read off the same chain either way.
   const auto = setInterval(() => {
@@ -544,26 +665,27 @@ export async function connect(): Promise<Economy> {
       // that was, instead of an order they cannot pay for.
       const refusal = purchaseBlock(state.coins, upgrade.name, upgrade.price)
       if (refusal !== null) {
-        state.message = refusal
-        changed()
+        tell(refusal, 'warn', 'shop')
         return
       }
 
       try {
-        state.message = null
+        hush('shop')
         // The order is placed for the proven wallet, so the transfer the shop
         // waits for is the one this browser is about to sign and no other.
         const order = await withSession((id) =>
-          post<{ to?: string; price?: number }>('/game/order', { session: id, sku }),
+          post<{ id?: string; to?: string; price?: number }>('/game/order', { session: id, sku }),
         )
-        if (!order.to || order.price === undefined) throw new Error('The shop did not answer.')
+        if (!order.to || order.price === undefined || !order.id) throw new Error('The shop did not answer.')
         // The player signs the payment. The shop signs the delivery. There is no
         // third arrangement in which one of them signs for the other.
         await coins.transfer(order.to, order.price)
-        state.message = `Bought ${upgrade.name}. It will arrive in a moment.`
-        changed()
+        // Optimism, and no longer the last word on it: the shop is asked how it
+        // ended, and the sentence is replaced by the answer.
+        tell(`Paid ${order.price} coins for ${upgrade.name}. Waiting for the shop.`, 'note', 'shop')
+        await follow(order.id)
       } catch (error) {
-        say(error)
+        say(error, 'shop')
       }
     },
 
@@ -586,16 +708,14 @@ export async function connect(): Promise<Economy> {
         // next rise from draining somebody else's coins out of `settling`.
         const amount = paid(body.bundle)
         state.coins = claimExpected(state.coins, amount)
-        state.message = `Claiming ${Math.floor(amount)} coins from the mob drop.`
-        changed()
+        tell(`Claiming ${Math.floor(amount)} coins from the mob drop.`, 'note', 'wallet')
         try {
           await addClaim(body.bundle)
         } catch (error) {
           state.coins = claimFailed(state.coins, amount)
           throw error
         }
-        state.message = `Claimed ${Math.floor(amount)} coins from the mob drop.`
-        changed()
+        tell(`Claimed ${Math.floor(amount)} coins from the mob drop.`, 'good', 'wallet')
       } catch (error) {
         say(error)
       }
@@ -608,13 +728,11 @@ export async function connect(): Promise<Economy> {
       // would sit in `settling` forever, since nothing is ever going to confirm
       // them. Both are refused here rather than paid for.
       if (!state.exchange.open) {
-        state.message = 'The exchange desk is closed. Press the button instead.'
-        changed()
+        tell('The exchange desk is closed. Press the button instead.', 'warn', 'wallet')
         return
       }
       if (amount < state.exchange.minimum) {
-        state.message = `The desk takes ${state.exchange.minimum} Kei at a time or more.`
-        changed()
+        tell(`The desk takes ${state.exchange.minimum} Kei at a time or more.`, 'warn', 'wallet')
         return
       }
 
@@ -625,14 +743,13 @@ export async function connect(): Promise<Economy> {
       // the mint arrives first and drains a banked press instead.
       const owed = amount * state.exchange.coinsPerKei
       state.coins = claimExpected(state.coins, owed)
-      state.message = null
+      hush('wallet')
       changed()
 
       try {
         if ((await kei.balance()) < amount) await fund()
         await kei.pay({ to: catalogue.issuer, amount })
-        state.message = `Paid ${amount} Kei. Coins on the way.`
-        changed()
+        tell(`Paid ${amount} Kei. Coins on the way.`, 'note', 'wallet')
       } catch (error) {
         // Nothing was paid, so nothing is owed for it.
         state.coins = claimFailed(state.coins, owed)

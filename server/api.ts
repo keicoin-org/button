@@ -91,6 +91,15 @@ export async function handleGameApi(game: Game, path: string, request: Request):
         return json(await game.order(session, origin, String(sku ?? '')))
       }
 
+      case '/game/purchases': {
+        // How the shop's side of a purchase ended. It carries a session and
+        // nothing else, because the answer is about the proven wallet — which is
+        // also what makes it survive a reload: a browser that lost its order id
+        // still has its key.
+        const { session } = await body<{ session: unknown }>(request)
+        return json({ purchases: game.purchases(session, origin) })
+      }
+
       default:
         return null
     }

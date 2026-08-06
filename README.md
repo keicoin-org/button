@@ -101,6 +101,15 @@ carries no memo, so the shop takes the order first and matches the arrival to it
 — and delivers nothing until the chain says the coins landed. The order is not
 the purchase.
 
+Once coins arrive there are exactly two honest endings — the item, or the coins
+back — and the player has to be able to tell which one happened. So `/game/order`
+names the order and `/game/purchases` says how it ended: delivered (with the
+item's **name**, never a hex asset id), returned (with the amount and the shop's
+own reason), or still open, described as still open rather than as a promise. It
+answers to the proven wallet rather than to a token the page is holding, which is
+what makes the answer survive a reload — a refund the player cannot see is close
+to indistinguishable from money that vanished.
+
 ## Where things are
 
 ```

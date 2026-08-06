@@ -325,6 +325,41 @@ describe('a starting balance comes from the game', () => {
   })
 })
 
+describe('the shop answers for itself', () => {
+  forEachDoor('a purchase can be followed to its ending through the door', async (arena) => {
+    const session = await authenticate(arena)
+    await pressThrough(arena, session, 30)
+    const { body: paid } = await arena.door('/game/bank', { session, batch: batchId() })
+    await arena.player.claims.add(paid.bundle)
+
+    const { body: order } = await arena.door('/game/order', { session, sku: 'glove' })
+    expect(order.id).toBeString()
+
+    const open = await arena.door('/game/purchases', { session })
+    expect(open.body.purchases.at(-1)).toMatchObject({ id: order.id, state: 'open' })
+
+    const coins = await arena.player.token(arena.game.catalogue().coin.asset)
+    await coins.transfer(order.to, order.price)
+
+    // The transfer is the player's and the delivery is the issuer's, so the only
+    // way this browser learns how it ended is by asking.
+    let settled: { state?: string; item?: string } = {}
+    for (let attempt = 0; attempt < 40 && settled.state !== 'delivered'; attempt++) {
+      await Bun.sleep(50)
+      const { body } = await arena.door('/game/purchases', { session })
+      settled = body.purchases.find((receipt: { id: string }) => receipt.id === order.id) ?? {}
+    }
+    expect(settled).toMatchObject({ state: 'delivered', item: 'Springy Glove' })
+  })
+
+  forEachDoor('receipts need a session, because they are about somebody’s money', async (arena) => {
+    const { status, body } = await arena.door('/game/purchases', {})
+    expect(status).toBe(400)
+    expect(body.purchases).toBeUndefined()
+    expect(body.error).toMatch(/Prove your address/)
+  })
+})
+
 describe('a caller cannot assert a kill', () => {
   forEachDoor('loot with a mob name instead of an event pays nothing', async (arena) => {
     const session = await authenticate(arena)
