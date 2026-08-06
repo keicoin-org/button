@@ -70,12 +70,15 @@ export async function handleGameApi(game: Game, path: string, request: Request):
         // the whole surface a caller invents. It buys nothing — it says which
         // payout is being asked for, so asking twice cannot buy two.
         const { session, batch } = await body<{ session: unknown; batch: unknown }>(request)
-        return json({ bundle: await game.bank(session, origin, batch) })
+        // `game.bank` already answers `{ bundle, amount }` (#26): the bundle is
+        // the merged issuer leaf, and `amount` is this call's own share of it,
+        // never the total a concurrent loot might also be reading.
+        return json(await game.bank(session, origin, batch))
       }
 
       case '/game/loot': {
         const { session, event } = await body<{ session: unknown; event: unknown }>(request)
-        return json({ bundle: await game.loot(session, origin, event) })
+        return json(await game.loot(session, origin, event))
       }
 
       case '/game/faucet': {

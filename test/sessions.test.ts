@@ -224,7 +224,10 @@ describe('a forged kill', () => {
     expect(() => game.hit(session, ORIGIN, 'slime-1')).toThrow('already dead')
 
     // And the one event the honest kill produced is still good.
-    await expect(game.loot(session, ORIGIN, first)).resolves.toMatchObject({ root: expect.any(String) })
+    await expect(game.loot(session, ORIGIN, first)).resolves.toMatchObject({
+      bundle: { root: expect.any(String) },
+      amount: 25,
+    })
   }, 20_000)
 })
 

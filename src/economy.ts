@@ -376,7 +376,7 @@ export async function connect(): Promise<Economy> {
   // Banking and mob drops both enter the SDK's one shared held-bundle map.
   // Serialize at that common boundary so no two claimAll sweeps can read and
   // submit the same proof concurrently.
-  const addClaim = serialClaims<ClaimBundle>((bundle) => kei.claims.add(bundle))
+  const addClaim = serialClaims((bundle) => kei.claims.add(bundle))
 
   // ------------------------------------------------------------------ banking
 
@@ -388,10 +388,6 @@ export async function connect(): Promise<Economy> {
    * after that. See `bank()` for what gets in through the gap.
    */
   let inFlight = false
-
-  /** A bundle's amount is raw units; every other figure in this file is display units. */
-  const paid = (bundle: ClaimBundle): number =>
-    Number(bundle.amount) / 10 ** catalogue.coin.decimals
 
   /**
    * The batch that is out, if one is.
@@ -425,6 +421,7 @@ export async function connect(): Promise<Economy> {
     const { id: batchId, presses, expected } = batch
 
     let bundle: ClaimBundle
+    let amount: number
     try {
       // No count goes out. The server pays for the presses it watched arrive,
       // and this browser's own tally is a prediction of that figure rather than
@@ -432,10 +429,15 @@ export async function connect(): Promise<Economy> {
       // id is the one thing this file names, and it buys nothing: it says which
       // payout is being asked for, so asking twice cannot buy two.
       const body = await withSession((id) =>
-        post<{ bundle?: ClaimBundle }>('/game/bank', { session: id, batch: batchId }),
+        post<{ bundle?: ClaimBundle; amount?: number }>('/game/bank', { session: id, batch: batchId }),
       )
-      if (!body.bundle) throw new Error('The game server sent no proof back.')
+      if (!body.bundle || body.amount === undefined) throw new Error('The game server sent no proof back.')
       bundle = body.bundle
+      // The server's own figure for what *this* bank contributed, never derived
+      // from the bundle: a bank and a mob drop can land in the same issuer block
+      // (`DropBatch`, `server/game.ts`), so `paid(bundle)` is the whole block's
+      // total and not this call's own share of it (#26).
+      amount = body.amount
     } catch (error) {
       if (!(error instanceof Refusal)) {
         // Nobody knows what happened, so nothing is decided here. The coins stay
@@ -461,10 +463,9 @@ export async function connect(): Promise<Economy> {
 
     // What the chain will pay, rather than what the presses were hoped to be
     // worth. The two differ whenever a press did not reach the server or was
-    // refused by its observation ceiling, and the bundle carries the figure the
-    // server actually saw. The headline drops to it here, once, at the moment
-    // the truth arrives.
-    const amount = paid(bundle)
+    // refused by its observation ceiling, and `amount` carries the figure the
+    // server actually saw *for this batch*. The headline drops to it here,
+    // once, at the moment the truth arrives.
     state.coins = banked(state.coins, expected, amount)
     // Only what banking itself had to say. The shop's answer about a purchase
     // stays up: a bank lands every three seconds while the player is pressing,
@@ -699,14 +700,17 @@ export async function connect(): Promise<Economy> {
         if (!blow.event) return false
 
         const body = await withSession((id) =>
-          post<{ bundle?: ClaimBundle }>('/game/loot', { session: id, event: blow.event }),
+          post<{ bundle?: ClaimBundle; amount?: number }>('/game/loot', { session: id, event: blow.event }),
         )
-        if (!body.bundle) throw new Error('The mob dropped no claim proof.')
+        if (!body.bundle || body.amount === undefined) throw new Error('The mob dropped no claim proof.')
 
         // A drop is owed exactly like a banked press is, so it goes through the
         // same stage. Registering it before claiming is what keeps the chain's
-        // next rise from draining somebody else's coins out of `settling`.
-        const amount = paid(body.bundle)
+        // next rise from draining somebody else's coins out of `settling`. The
+        // amount is the server's own figure for this kill, not `paid(bundle)`:
+        // a bank and a loot can land in the same issuer block, and the bundle
+        // then carries their combined total rather than this drop's own 25 (#26).
+        const amount = body.amount
         state.coins = claimExpected(state.coins, amount)
         tell(`Claiming ${Math.floor(amount)} coins from the mob drop.`, 'note', 'wallet')
         try {

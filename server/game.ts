@@ -69,15 +69,17 @@ export interface Game {
   /** One hit on a mob. This server decides when it died, and names the event. */
   hit(session: unknown, origin: string, mob: unknown): HitReceipt
   /**
-   * Pay for the presses this server observed. Returns the proof to claim with (§5.5).
+   * Pay for the presses this server observed. Returns the proof to claim with
+   * (§5.5), and this call's own share of it — a bank and a loot can land in the
+   * same issuer block (`DropBatch`), and `amount` is never the whole block's.
    *
    * `batch` names the attempt. Two calls carrying the same one are the same
    * batch however many times the caller asks, which is what makes a retry after
    * a lost response safe.
    */
-  bank(session: unknown, origin: string, batch: unknown): Promise<ClaimBundle>
+  bank(session: unknown, origin: string, batch: unknown): Promise<Payout>
   /** Collect a kill this server recorded, by the event id the kill returned. */
-  loot(session: unknown, origin: string, event: unknown): Promise<ClaimBundle>
+  loot(session: unknown, origin: string, event: unknown): Promise<Payout>
   /**
    * A starting balance for a proven wallet that has none.
    *
@@ -378,7 +380,7 @@ export { GameError } from './errors.js'
  */
 class DropBatch {
   private pending = new Map<string, number>()
-  private waiting = new Map<string, Array<(bundle: ClaimBundle) => void>>()
+  private waiting = new Map<string, Array<{ amount: number; resolve: (drop: Payout) => void }>>()
   private failures = new Map<string, Array<(error: unknown) => void>>()
   private timer: ReturnType<typeof setTimeout> | undefined
 
@@ -387,13 +389,15 @@ class DropBatch {
     private readonly flushMs: number,
   ) {}
 
-  add(address: string, amount: number): Promise<ClaimBundle> {
+  add(address: string, amount: number): Promise<Payout> {
     // Merged per address: a root commits to at most one entitlement per account,
-    // so two banks inside one window are one leaf, not two.
+    // so two banks inside one window are one leaf, not two. `amount` is kept
+    // alongside each caller's own resolver, not just summed into `pending` —
+    // that is the whole fix for #26, below.
     this.pending.set(address, (this.pending.get(address) ?? 0) + amount)
 
-    return new Promise<ClaimBundle>((resolve, reject) => {
-      push(this.waiting, address, resolve)
+    return new Promise<Payout>((resolve, reject) => {
+      push(this.waiting, address, { amount, resolve })
       push(this.failures, address, reject)
       this.timer ??= setTimeout(() => void this.flush(), this.flushMs)
     })
@@ -413,7 +417,14 @@ class DropBatch {
       const drop = await this.coins.commit(batch.map(([to, amount]) => ({ to, amount })))
       for (const [address] of batch) {
         const bundle = drop.proofFor(address)
-        for (const resolve of waiting.get(address) ?? []) resolve(bundle)
+        // One bundle, the merged leaf — but each caller is resolved with its own
+        // contribution, not the total. Before this a bank and a loot landing in
+        // the same window were both handed the full merged amount as if it were
+        // theirs (#26): a 20-coin bank and a 25-coin kill in one window both read
+        // 45, both told the player 45, and both submitted the identical bundle to
+        // `claims.add` — one of the two duplicate submissions then failed, and the
+        // failure was blamed on the wrong amount.
+        for (const { amount, resolve } of waiting.get(address) ?? []) resolve({ bundle, amount })
       }
     } catch (error) {
       for (const [address] of batch) {
@@ -426,6 +437,16 @@ class DropBatch {
     if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
   }
+}
+
+/**
+ * What one caller into `DropBatch.add` is owed: the merged leaf, and this
+ * caller's own share of it — never the total, which is what let a bank and a
+ * loot in the same window both read the other's coins as their own (#26).
+ */
+export interface Payout {
+  bundle: ClaimBundle
+  amount: number
 }
 
 function push<T>(map: Map<string, T[]>, key: string, value: T): void {
@@ -460,36 +481,36 @@ function push<T>(map: Map<string, T[]>, key: string, value: T): void {
  * this map never becomes a second ledger of who is owed what.
  */
 class BatchLog {
-  private open = new Map<string, { address: string; bundle: Promise<ClaimBundle> }>()
-  private published = new Map<string, { address: string; bundle: ClaimBundle; at: number }>()
+  private open = new Map<string, { address: string; drop: Promise<Payout> }>()
+  private published = new Map<string, { address: string; drop: Payout; at: number }>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
   /** The proof this id already bought, or nothing if it has bought none yet. */
-  find(id: string, address: string): Promise<ClaimBundle> | undefined {
+  find(id: string, address: string): Promise<Payout> | undefined {
     this.forget()
 
     const done = this.published.get(id)
-    if (done) return Promise.resolve(mine(done.address, address, done.bundle))
+    if (done) return Promise.resolve(mine(done.address, address, done.drop))
 
     const running = this.open.get(id)
-    if (running) return mine(running.address, address, running.bundle)
+    if (running) return mine(running.address, address, running.drop)
 
     return undefined
   }
 
   /** Record an attempt, and remember its proof if it publishes one. */
-  begin(id: string, address: string, paying: Promise<ClaimBundle>): Promise<ClaimBundle> {
-    this.open.set(id, { address, bundle: paying })
+  begin(id: string, address: string, paying: Promise<Payout>): Promise<Payout> {
+    this.open.set(id, { address, drop: paying })
     return paying.then(
-      (bundle) => {
+      (drop) => {
         this.open.delete(id)
         if (this.published.size >= MAX_REMEMBERED_BATCHES) {
           const oldest = this.published.keys().next()
           if (!oldest.done) this.published.delete(oldest.value)
         }
-        this.published.set(id, { address, bundle, at: this.now() })
-        return bundle
+        this.published.set(id, { address, drop, at: this.now() })
+        return drop
       },
       (error: unknown) => {
         // Nothing was published under this id, so nothing is remembered under
