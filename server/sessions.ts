@@ -427,6 +427,13 @@ export function createSessions(options: SessionOptions): SessionRegistry {
       session.fights.delete(mob)
       const event = randomChallengeNonce()
       events.set(event, { session: session.id, address: session.address, mob, at: now() })
+      // One mob pays out at most once per address, and that has to be true from
+      // the moment the event exists rather than from the moment it is redeemed
+      // (#31) — otherwise the window between a kill and its collection is open
+      // for the same mob to be killed again, and again, each kill minting its
+      // own independently redeemable event. `redeem()` no longer needs to write
+      // this; it is already true by the time there is anything to redeem.
+      looted.add(`${session.address}:${mob}`)
       return { mob, hits: HITS_PER_MOB, needed: HITS_PER_MOB, event }
     },
 
@@ -463,14 +470,20 @@ export function createSessions(options: SessionOptions): SessionRegistry {
         throw new SessionError('That kill belongs to a different session.')
       }
       // Deleted before the payout is awaited, so two redemptions of one kill
-      // cannot both reach the issuer.
+      // cannot both reach the issuer. `looted` is not written here: `hit()`
+      // already marked this mob spoken-for the moment the kill produced this
+      // event, which is what stops a second kill of it from ever reaching here.
       events.delete(event)
-      looted.add(`${record.address}:${record.mob}`)
       return { session: bare(session), mob: record.mob }
     },
 
     unredeem(event, entry) {
-      looted.delete(`${entry.address}:${entry.mob}`)
+      // `looted` is left alone. It marks this mob spoken-for from the moment
+      // `hit()` created the event (#31), and that is still true — the event is
+      // being restored so the same kill can be retried, not released so a fresh
+      // one can be farmed. Clearing it here would reopen the exact window #31
+      // closed: a client that re-hits the mob after a failed payout, instead of
+      // retrying the event it already has, would mint a second one.
       events.set(event, { ...entry, at: now() })
     },
   }

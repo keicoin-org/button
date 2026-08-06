@@ -205,6 +205,51 @@ describe('a forged kill', () => {
       expect(() => game.hit(session, ORIGIN, mob)).toThrow('does not exist')
     }
   }, 20_000)
+
+  /**
+   * #31: `looted` used to be written only at `redeem()`, so the window between a
+   * kill landing and its drop being collected was unguarded — the same mob could
+   * be killed again, and again, each kill minting its own independently
+   * redeemable event. `hit()` now marks the mob spoken-for the moment the event
+   * is created, which is the earliest point there is anything to protect.
+   */
+  test('a mob already killed cannot be killed again before its drop is collected', async () => {
+    const { game, session } = await boardWithSession()
+    const first = kill(game, session, 'slime-1')
+    expect(first).toMatch(/^[0-9A-F]{64}$/)
+
+    // The kill landed and the event is sitting there, uncollected. Farming it
+    // again — the exact shape of #31's reproduction — is refused immediately,
+    // not merely once its one legitimate drop has been redeemed.
+    expect(() => game.hit(session, ORIGIN, 'slime-1')).toThrow('already dead')
+
+    // And the one event the honest kill produced is still good.
+    await expect(game.loot(session, ORIGIN, first)).resolves.toMatchObject({ root: expect.any(String) })
+  }, 20_000)
+})
+
+describe('an honest kill whose payout failed', () => {
+  test('unredeem releases the mob for a fresh kill, not a second copy of the old one', async () => {
+    const sessions = bare()
+    const keys = await keyPairFromSeed(randomSeed(), 0)
+    const id = await prove(sessions, keys)
+
+    let event = ''
+    for (let hit = 0; hit < HITS_PER_MOB; hit++) event = sessions.hit(id, ORIGIN, 'slime-1').event ?? event
+    expect(event).toMatch(/^[0-9A-F]{64}$/)
+
+    // Server-side, `server/game.ts`'s `loot()` calls this on exactly this path:
+    // the mint that would have paid for the kill failed after `redeem()` had
+    // already deleted the event, so the kill has to be given back rather than
+    // eaten.
+    const { mob } = sessions.redeem(id, ORIGIN, event)
+    sessions.unredeem(event, { session: id, address: keys.address, mob })
+
+    // The mob is killable again — the point of `unredeem` — and it is the same
+    // event coming back, not a second one stacked on top of the first.
+    expect(() => sessions.hit(id, ORIGIN, 'slime-1')).toThrow('already dead')
+    expect(sessions.redeem(id, ORIGIN, event).mob).toBe('slime-1')
+  })
 })
 
 /**
@@ -291,22 +336,30 @@ describe('the observation ceiling', () => {
   }, 20_000)
 
   test('hits come out of the same budget as presses', async () => {
+    // Two fresh addresses, so each starts from the same untouched bucket
+    // (`now` is fixed, so neither refills between calls) and the two totals
+    // below are directly comparable.
     let clock = 1_000_000
     const sessions = bare({ now: () => clock, refillPerSecond: 25 })
-    const keys = await keyPairFromSeed(randomSeed(), 0)
-    const id = await prove(sessions, keys)
 
-    for (let index = 0; index < 20; index++) sessions.press(id, ORIGIN)
-    let hits = 0
-    for (;;) {
-      try {
-        sessions.hit(id, ORIGIN, 'slime-1')
-        hits += 1
-      } catch {
-        break
+    const capacity = drain(sessions, await prove(sessions, await keyPairFromSeed(randomSeed(), 0)))
+
+    // #31 fixed one mob into at most one kill per address ever, which rules out
+    // draining a bucket by farming a single mob the way this test used to. Nine
+    // hits — the three mobs there are, each to death — is as far as hits alone
+    // can go; whatever budget is left over is drained with presses instead. If a
+    // hit spent anything other than one token from the same bucket a press does,
+    // this total would not match `capacity`.
+    const id = await prove(sessions, await keyPairFromSeed(randomSeed(), 1))
+    let spent = 0
+    for (const mob of ['slime-1', 'slime-2', 'slime-3']) {
+      for (let blow = 0; blow < HITS_PER_MOB; blow++) {
+        sessions.hit(id, ORIGIN, mob)
+        spent += 1
       }
     }
-    expect(hits).toBe(30)
+    spent += drain(sessions, id)
+    expect(spent).toBe(capacity)
   }, 20_000)
 
   test('the default is a human rate rather than a scripted one', async () => {
