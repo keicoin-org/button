@@ -651,6 +651,18 @@ export async function connect(): Promise<Economy> {
     if (state.pressesPerSecond > 0) press(state.pressesPerSecond)
   }, 1_000)
 
+  /**
+   * A kill this browser has already earned an event for, but has not yet
+   * collected — by mob.
+   *
+   * `/game/hit` refuses a mob that already has an outstanding or paid event
+   * (#31: one kill, ever, per address), so a retry after a failed `/game/loot`
+   * cannot be another call to `/game/hit` — it has to be the same event, asked
+   * for again. This is what lets a second click do that instead of being
+   * refused as "already dead".
+   */
+  const pendingDrops = new Map<string, string>()
+
   return {
     state,
 
@@ -691,18 +703,31 @@ export async function connect(): Promise<Economy> {
     },
 
     async hit(mob) {
+      // A kill this browser is still owed collection for, from an earlier call
+      // that got the event but not the drop. Asked for again rather than
+      // hitting the mob a second time — `/game/hit` would refuse that outright
+      // (#31), and there is nothing wrong with the event itself to justify one.
+      let event = pendingDrops.get(mob)
       try {
-        // A slime takes several hits and the server counts them, so a drop is
-        // paid for a fight this server watched rather than for a claim that one
-        // happened. The kill comes back as an event id — the only thing
-        // `/game/loot` accepts, and good for one collection.
-        const blow = await withSession((id) => post<{ event?: string }>('/game/hit', { session: id, mob }))
-        if (!blow.event) return false
+        if (event === undefined) {
+          // A slime takes several hits and the server counts them, so a drop is
+          // paid for a fight this server watched rather than for a claim that
+          // one happened. The kill comes back as an event id — the only thing
+          // `/game/loot` accepts, and good for one collection.
+          const blow = await withSession((id) => post<{ event?: string }>('/game/hit', { session: id, mob }))
+          if (!blow.event) return false
+          event = blow.event
+        }
 
         const body = await withSession((id) =>
-          post<{ bundle?: ClaimBundle; amount?: number }>('/game/loot', { session: id, event: blow.event }),
+          post<{ bundle?: ClaimBundle; amount?: number }>('/game/loot', { session: id, event }),
         )
         if (!body.bundle || body.amount === undefined) throw new Error('The mob dropped no claim proof.')
+
+        // The server has settled the kill: the event is spent and the payout is
+        // committed. There is nothing left here to retry by clicking again, so
+        // the mob is honestly dead from this point on, whatever happens next.
+        pendingDrops.delete(mob)
 
         // A drop is owed exactly like a banked press is, so it goes through the
         // same stage. Registering it before claiming is what keeps the chain's
@@ -716,14 +741,26 @@ export async function connect(): Promise<Economy> {
         try {
           await addClaim(body.bundle)
         } catch (error) {
+          // Only the proof's own submission failed; the coins are already
+          // committed server-side. The SDK keeps the bundle and retries it in
+          // the background, the same as a failed bank claim (`runBank`) — the
+          // kill stands, so this is told to the player without undoing it.
           state.coins = claimFailed(state.coins, amount)
-          throw error
+          say(error)
+          return true
         }
         tell(`Claimed ${Math.floor(amount)} coins from the mob drop.`, 'good', 'wallet')
+        return true
       } catch (error) {
+        // `/game/hit` or `/game/loot` itself failed, which says the kill is not
+        // confirmed — never that it happened. The mob stays on screen for
+        // exactly that reason: reporting `true` here is what used to delete a
+        // mesh for a hit the server refused, or strand a drop the server had
+        // already restored for a retry (#25, #22).
+        if (event !== undefined) pendingDrops.set(mob, event)
         say(error)
+        return false
       }
-      return true
     },
 
     async topUp(amount) {
