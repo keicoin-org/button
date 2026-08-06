@@ -13,10 +13,11 @@
  * it writes; this server never sees a player's key and cannot move their money.
  */
 
-import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
+import { MockNode, randomSeed } from 'kei-transaction'
 
 import { handleGameApi } from './api.js'
 import { startGame } from './game.js'
+import { publicNodeRpc } from './rpc.js'
 
 /** Native, and with a trailing separator — `pathname` would hand Windows `/C:/…`. */
 const root = Bun.fileURLToPath(new URL('..', import.meta.url))
@@ -38,7 +39,10 @@ if (!bundle.success) {
 // their browser and outlives it, which just means they come back to an empty
 // account on a new chain — the honest behaviour for a mock.
 const node = await MockNode.create()
-const rpc = mockRpcHandler({ node })
+// The same guarded surface the deployed Worker serves. A development server
+// that exposed the faucet and a deployment that did not would be two different
+// games, and the one people read is this one.
+const rpc = publicNodeRpc(node)
 
 const game = await startGame({
   seed: process.env.KEI_GAME_SEED ?? randomSeed(),

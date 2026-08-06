@@ -107,6 +107,7 @@ the purchase.
 shared/catalogue.ts   what a press is worth and what upgrades cost — used by both halves
 server/game.ts        the issuer: token, items, the batcher, the shop. The whole backend.
 server/main.ts        one Bun server: the mock node at /rpc, the game at /game/*, the client at /
+server/rpc.ts         what the public is allowed to ask the node for — reads and its own blocks, never a mint
 src/economy.ts        every line of Kei in the client
 src/ledger.ts         where a coin is — counted, clearing, or confirmed. Pure arithmetic.
 src/world.ts          Babylon: the button, the screen, the shopkeeper
@@ -145,8 +146,17 @@ it says on the screen that nothing is being banked.
   pressing at about a finger's speed, rather than a client that could claim any
   number it liked. M8 adds Colyseus, and presses become observed by other players
   too.
-- **The chain is a mock.** M2 is the real node; M3 points `/rpc` at it, and
-  nothing above that line changes.
+- **The chain is a mock, and `/rpc` is public.** M2 is the real node; M3 points
+  `/rpc` at it, and nothing above that line changes. The browser is a real wallet
+  and needs a node, so the path stays open — but only for reads and for blocks
+  the caller signed. The mock's faucet is not on it: it took its amount from the
+  request body, and one POST minted a million Kei, which at the exchange desk is
+  COIN's entire max supply and the end of the shop for everybody (#30). A
+  starting balance comes from `/game/faucet` instead: a fixed ten Kei, to a
+  wallet that has proved it holds its key, once an hour, and only into an empty
+  one. Free keypairs mean an attacker can still ask many times — but each ask
+  costs a challenge, a signature and an hour, which is a hundred thousand of them
+  to reach the cap rather than two curls.
 - **The issuer seed is generated per run** unless `KEI_GAME_SEED` is set. A new
   issuer means new asset ids, which is fine here because the ledger is new too.
 

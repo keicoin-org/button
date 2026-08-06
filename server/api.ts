@@ -78,6 +78,14 @@ export async function handleGameApi(game: Game, path: string, request: Request):
         return json({ bundle: await game.loot(session, origin, event) })
       }
 
+      case '/game/faucet': {
+        // No amount, and no address. Both are the server's, which is the whole
+        // of #30: the mock node's faucet took them from the caller and was
+        // mounted where a stranger could reach it.
+        const { session } = await body<{ session: unknown }>(request)
+        return json(await game.faucet(session, origin))
+      }
+
       case '/game/order': {
         const { session, sku } = await body<{ session: unknown; sku: unknown }>(request)
         return json(await game.order(session, origin, String(sku ?? '')))
