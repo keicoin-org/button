@@ -16,8 +16,9 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
+import { MockNode, randomSeed } from 'kei-transaction'
 
+import { publicNodeRpc } from '../server/rpc.js'
 import { startGame, type Game } from '../server/game.js'
 import { apiPath, handleArenaRequest } from './router.js'
 
@@ -43,7 +44,11 @@ export class Arena extends DurableObject<Env> {
         network: 'mock',
         exchange: this.env.BUTTON_EXCHANGE !== 'off',
       })
-      return { game, rpc: mockRpcHandler({ node }) }
+      // Guarded, because this one is genuinely public: `/examples/button/rpc`
+      // is reachable by anybody, and the mock's faucet takes its amount from the
+      // request body (#30). A wallet's reads and its own signed blocks go
+      // through; a mint does not.
+      return { game, rpc: publicNodeRpc(node) }
     })()
     return this.#booting
   }

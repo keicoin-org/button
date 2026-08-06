@@ -77,6 +77,14 @@ export interface Game {
   bank(session: unknown, origin: string, batch: unknown): Promise<ClaimBundle>
   /** Collect a kill this server recorded, by the event id the kill returned. */
   loot(session: unknown, origin: string, event: unknown): Promise<ClaimBundle>
+  /**
+   * A starting balance for a proven wallet that has none.
+   *
+   * The node's faucet is not on the public RPC surface (`server/rpc.ts`), and
+   * this is what replaces it: the same grant, given to an address that has
+   * proved it holds its key, in an amount this server states and a caller cannot.
+   */
+  faucet(session: unknown, origin: string): Promise<{ granted: number }>
   /** Take an order, so an anonymous coin transfer can be matched to a purchase. */
   order(session: unknown, origin: string, sku: string): Promise<{ to: string; price: number; asset: string }>
   close(): void
@@ -113,6 +121,25 @@ export function issuanceCost(alreadyIssued: number, assets: number): number {
   // whole number of Kei, and 10^18 raw units do not survive a float.
   return Number(raw / 10n ** BigInt(KEI_DECIMALS))
 }
+
+/**
+ * A new player's starting Kei, and how often one address may be given it.
+ *
+ * The figure is here rather than in the request, which is the entire lesson of
+ * #30: the mock node's faucet took its amount from the caller and was mounted on
+ * a public path, so two curls minted a million Kei and closed the shop for
+ * everybody by exhausting COIN's max supply through the exchange desk.
+ *
+ * Ten Kei is what the mock's own default grant is, so a first-time visitor gets
+ * exactly what they got before. At the posted rate it buys 10,000 coins, which
+ * is a demo's worth of shopping and 0.001% of the coin cap — a hundred thousand
+ * proven wallets would be needed to reach the cap this way, and each of them
+ * costs a challenge, a signature and an hour's wait.
+ */
+const FAUCET_KEI = 10
+const FAUCET_EVERY_MS = 60 * 60_000
+/** Addresses remembered for the rate limit. Past this the oldest is forgotten. */
+const MAX_FAUCET_RECORDS = 8_192
 
 /** What a slime is worth, in coins. */
 const MOB_DROP = 25
@@ -181,6 +208,7 @@ export async function startGame(options: GameOptions): Promise<Game> {
     ? kei.acceptTopUps({ token: coins, rate: COINS_PER_KEI, minimum: MINIMUM_TOP_UP })
     : undefined
 
+  const grants = new Faucet(kei, options.now ?? Date.now)
   const shop = openShop(kei, coins, items)
   const drops = new DropBatch(coins, options.flushMs ?? 1_500)
   const batches = new BatchLog()
@@ -273,6 +301,14 @@ export async function startGame(options: GameOptions): Promise<Game> {
         sessions.unredeem(String(event), { session: who.id, address: who.address, mob })
         throw error
       }
+    },
+
+    async faucet(session, origin) {
+      // A grant is money, so it goes to a wallet that has proved it holds its
+      // key — never to an address out of a request body, and never in an amount
+      // out of one either.
+      const { address } = sessions.require(session, origin)
+      return grants.give(address)
     },
 
     order(session, origin, sku) {
@@ -465,6 +501,70 @@ function batchId(value: unknown): string {
     throw new GameError('A batch id is up to 64 letters, digits, ".", "_" or "-".')
   }
   return id
+}
+
+// -------------------------------------------------------------------- faucet
+
+/**
+ * The only mint a stranger can reach, and everything about it is this server's.
+ *
+ * Before #30 the mock node's faucet was on the public `/rpc` path with its
+ * amount taken from the request body, which is an unauthenticated mint with no
+ * ceiling. The route is closed now (`server/rpc.ts`), and this is what a new
+ * player gets instead. Three things are the server's and not the caller's:
+ *
+ *   - **who** — a session, so the address has proved it holds its key;
+ *   - **how much** — `FAUCET_KEI`, a constant, with no field for a figure;
+ *   - **how often** — once an hour per address, and only into an empty wallet.
+ *
+ * A wallet that is not empty is refused rather than topped up, so grants cannot
+ * be accumulated by an address that keeps asking.
+ */
+class Faucet {
+  private given = new Map<string, number>()
+
+  constructor(
+    private readonly kei: Kei,
+    private readonly now: () => number,
+  ) {}
+
+  async give(address: string): Promise<{ granted: number }> {
+    if (this.kei.network === 'mainnet') {
+      throw new GameError('There is no faucet on mainnet. Fund this wallet and come back.')
+    }
+
+    const at = this.now()
+    const last = this.given.get(address)
+    if (last !== undefined && at - last < FAUCET_EVERY_MS) {
+      throw new GameError('The faucet gives one grant an hour to an address. Press the button in the meantime.')
+    }
+
+    // Read off the chain, so "empty" is the chain's answer rather than this
+    // server's memory of it — a restarted issuer must not hand a funded wallet
+    // a second grant just because it has forgotten the first.
+    const account = await this.kei.client.node.accountInfo(address)
+    if (account !== null && BigInt(account.balance) > 0n) {
+      throw new GameError('That wallet already has Kei. The faucet is for an empty one.')
+    }
+
+    if (this.given.size >= MAX_FAUCET_RECORDS) {
+      const oldest = this.given.keys().next()
+      if (!oldest.done) this.given.delete(oldest.value)
+    }
+    // Written before the grant, not after: a grant that lands and then fails to
+    // be recorded is a second grant on the next request.
+    this.given.set(address, at)
+
+    // The amount is this server's. `node.faucet` takes one, and the fix is that
+    // nothing reachable from outside gets to fill it in.
+    await this.kei.client.node.faucet(address, toRawKei(FAUCET_KEI))
+    return { granted: FAUCET_KEI }
+  }
+}
+
+/** Whole Kei as the raw decimal string the node interface takes (SPEC §5.10). */
+function toRawKei(amount: number): string {
+  return (BigInt(amount) * 10n ** BigInt(KEI_DECIMALS)).toString()
 }
 
 // ---------------------------------------------------------------------- shop

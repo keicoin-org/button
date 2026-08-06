@@ -20,12 +20,14 @@
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { keyPairFromSeed, randomSeed } from '@keicoin/core'
+import { HttpNode, Kei } from 'kei-transaction'
 
 import { handleGameApi } from '../server/api.js'
+import { publicNodeRpc } from '../server/rpc.js'
 import { handleArenaRequest } from '../worker/router.js'
 import type { Game } from '../server/game.js'
 import { sign } from '../src/ownership.js'
-import { batchId, table, type Table } from './support.js'
+import { batchId, table, until, type Table } from './support.js'
 
 const running: Array<{ close(): void }> = []
 afterEach(() => {
@@ -38,14 +40,20 @@ type Door = (path: string, body: unknown, origin?: string) => Promise<{ status: 
 interface Arena extends Table {
   door: Door
   origin: string
+  /** A `fetch` that reaches this door's `/rpc`, so a real wallet can be pointed at it. */
+  fetchRpc: typeof globalThis.fetch
 }
 
 /** `bun run dev`: a real listener, reached over the network. */
 async function bunDoor(options: Parameters<typeof table>[0] = {}): Promise<Arena> {
   const built = await table(options)
+  // The node is mounted the way `server/main.ts` mounts it, because `/rpc` is a
+  // public path and what is reachable on it is the subject of #30.
+  const rpc = publicNodeRpc(built.node)
   const server = Bun.serve({
     port: 0,
     routes: {
+      '/rpc': { POST: rpc, OPTIONS: rpc },
       '/game/*': async (request) => {
         const path = new URL(request.url).pathname
         return (await handleGameApi(built.game, path, request)) ?? new Response('Not found', { status: 404 })
@@ -58,6 +66,7 @@ async function bunDoor(options: Parameters<typeof table>[0] = {}): Promise<Arena
   return {
     ...built,
     origin,
+    fetchRpc: globalThis.fetch,
     async door(path, body, from = origin) {
       const response = await fetch(`${origin}${path}`, {
         method: 'POST',
@@ -74,11 +83,20 @@ async function workerDoor(options: Parameters<typeof table>[0] = {}): Promise<Ar
   const built = await table(options)
   running.push(built)
   const origin = 'https://keicoin.org'
-  const rpc = async (): Promise<Response> => new Response('rpc', { status: 200 })
+  // The handler `worker/index.ts` builds, not a stand-in: `/examples/button/rpc`
+  // is served to the public and what it will answer is the point of these tests.
+  const rpc = publicNodeRpc(built.node)
 
   return {
     ...built,
     origin,
+    // The Worker has no listener, so a wallet reaches it the way every other
+    // request in this file does: through `handleArenaRequest` itself.
+    fetchRpc: Object.assign(
+      (input: URL | RequestInfo, init?: RequestInit): Promise<Response> =>
+        handleArenaRequest(built.game, rpc, new Request(input as string, init)),
+      { preconnect: () => undefined },
+    ) as typeof globalThis.fetch,
     async door(path, body, from = origin) {
       const response = await handleArenaRequest(
         built.game,
@@ -203,6 +221,107 @@ describe('a bank names its batch', () => {
     await arena.player.claims.add(paid.bundle)
     const coins = await arena.player.token(arena.game.catalogue().coin.asset)
     expect(await coins.balance()).toBe(4)
+  })
+})
+
+/**
+ * `/rpc` is public, and what it will do for a stranger.
+ *
+ * The browser half of this demo is a real wallet, so the node has to be
+ * reachable from the page: it reads its own balance and publishes its own signed
+ * blocks, and neither can go through the game server without making the game
+ * server the thing that holds the money. What must not be reachable is the
+ * mock's faucet, which took its amount from the request body — two POSTs minted
+ * a million Kei and turned it into COIN's whole max supply at the exchange desk,
+ * after which every player's bank fails against the cap (#30).
+ *
+ * These run against the real handler both doors serve, at the mounted URL the
+ * deployed Worker answers on.
+ */
+describe('the public node does not mint', () => {
+  forEachDoor('the faucet action is refused, whatever amount it names', async (arena) => {
+    const thief = (await keyPairFromSeed(randomSeed(), 0)).address
+
+    // Issue #30's first curl, verbatim: 10^24 raw is 1,000,000 Kei.
+    const { body } = await arena.door('/rpc', {
+      action: 'faucet',
+      account: thief,
+      amount: '1000000000000000000000000',
+    })
+    expect(body.hash).toBeUndefined()
+    expect(body.error).toMatch(/does not mint/)
+
+    // Nothing was minted, so the second step of the scenario has nothing to
+    // spend: no Kei, therefore no top-up, therefore no run at COIN's cap.
+    const account = await arena.node.accountInfo(thief)
+    expect(account === null || BigInt(account.balance) === 0n).toBe(true)
+  })
+
+  forEachDoor('an amountless faucet call is refused too, not merely a capped one', async (arena) => {
+    const thief = (await keyPairFromSeed(randomSeed(), 0)).address
+    const { body } = await arena.door('/rpc', { action: 'faucet', account: thief })
+    expect(body.error).toMatch(/does not mint/)
+    expect(await arena.node.accountInfo(thief)).toBe(null)
+  })
+
+  forEachDoor('an action this node has never heard of is refused rather than tried', async (arena) => {
+    // The allow-list's real job: it is not a list of known-bad actions, so an
+    // action added to the SDK later is refused until somebody has looked at it.
+    const { body } = await arena.door('/rpc', { action: 'mint_everything', account: arena.player.address })
+    expect(body.error).toMatch(/does not mint/)
+  })
+
+  forEachDoor('a wallet can still read and still publish, which is the whole point', async (arena) => {
+    const { body: info } = await arena.door('/rpc', { action: 'account_info', account: arena.player.address })
+    expect(info.error).toBeUndefined()
+    expect(info).toHaveProperty('account')
+
+    // A whole wallet over the guarded surface: `HttpNode` speaks docs/rpc.md and
+    // this points it at the same handler the browser reaches. If the guard broke
+    // reads or `process`, none of this would get off the ground.
+    const player = await Kei.start({
+      node: new HttpNode({ url: `${arena.origin}/rpc`, network: 'mock', fetch: arena.fetchRpc }),
+      seed: randomSeed(),
+    })
+    running.push({ close: () => player.close() })
+
+    const session = await authenticate({ ...arena, player } as Arena)
+    for (let press = 0; press < 5; press++) await arena.door('/game/press', { session })
+    const { body: banked } = await arena.door('/game/bank', { session, batch: batchId() })
+    await player.claims.add(banked.bundle)
+
+    const coins = await player.token(arena.game.catalogue().coin.asset)
+    expect(await coins.balance()).toBe(5)
+  })
+})
+
+describe('a starting balance comes from the game', () => {
+  forEachDoor('a proven wallet is granted a fixed amount it cannot state', async (arena) => {
+    const session = await authenticate(arena)
+
+    // No amount in the body, and one in it changes nothing.
+    const { status, body } = await arena.door('/game/faucet', { session, amount: '1000000', kei: 1_000_000 })
+    expect(status).toBe(200)
+    expect(body.granted).toBe(10)
+
+    // Ten, and ten however loudly the body asked for a million. The wallet
+    // collects it the way it collects anything else sent to it.
+    await until(async () => (await arena.player.balance()) === 10, 'the grant to be collected')
+  })
+
+  forEachDoor('a second grant to the same wallet is refused', async (arena) => {
+    const session = await authenticate(arena)
+    await arena.door('/game/faucet', { session })
+
+    const { status, body } = await arena.door('/game/faucet', { session })
+    expect(status).toBe(400)
+    expect(body.error).toMatch(/one grant an hour/)
+  })
+
+  forEachDoor('a grant needs a session, so it is not a mint by URL', async (arena) => {
+    const { status, body } = await arena.door('/game/faucet', { address: arena.player.address })
+    expect(status).toBe(400)
+    expect(body.error).toMatch(/Prove your address/)
   })
 })
 

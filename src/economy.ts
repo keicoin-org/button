@@ -219,12 +219,6 @@ export async function connect(): Promise<Economy> {
   state.address = kei.address
   state.online = true
 
-  // On a mock chain a new player funds themselves, which is what a testnet
-  // faucet is for (SPEC §12). On mainnet this is the one human step there is.
-  if ((await kei.balance()) === 0 && catalogue.network !== 'mainnet') {
-    await kei.faucet().catch(() => undefined)
-  }
-
   const apply = (summary: WalletSummary): void => {
     const held = summary.tokens.find((token) => token.asset === catalogue.coin.asset)
     state.kei = summary.kei
@@ -304,8 +298,26 @@ export async function connect(): Promise<Economy> {
     }
   }
 
+  /**
+   * Ask the game for a starting balance.
+   *
+   * Not `kei.faucet()`, which is an RPC call to the node — that action is no
+   * longer on the public node surface, because it took its amount from whoever
+   * called it and the node is reachable by anybody (#30). The game gives the
+   * grant instead: to this proven wallet, in a figure the server states, and at
+   * a rate it decides. There is nothing to put an amount in below, which is the
+   * point.
+   */
+  const fund = async (): Promise<void> => {
+    if (catalogue.network === 'mainnet') return
+    await withSession((id) => post('/game/faucet', { session: id }))
+  }
+
   try {
     await openSession()
+    // A new wallet on a mock chain funds itself, which is what a testnet faucet
+    // is for (SPEC §12). On mainnet this is the one human step there is.
+    if (state.kei === 0) await fund().catch(() => undefined)
   } catch (error) {
     // The chain is reachable and the game server is not willing to watch this
     // wallet. Presses still count on screen and still bank nothing, which is the
@@ -617,7 +629,7 @@ export async function connect(): Promise<Economy> {
       changed()
 
       try {
-        if ((await kei.balance()) < amount && catalogue.network !== 'mainnet') await kei.faucet()
+        if ((await kei.balance()) < amount) await fund()
         await kei.pay({ to: catalogue.issuer, amount })
         state.message = `Paid ${amount} Kei. Coins on the way.`
         changed()
