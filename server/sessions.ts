@@ -82,8 +82,27 @@ export interface SessionOptions extends CeilingOptions {
   sessionTtlMs?: number
   /** Live sessions kept. The oldest is dropped past this, and re-proving is cheap. */
   maxSessions?: number
-  /** Outstanding challenges kept. Past this the oldest is refused, never re-admitted. */
+  /**
+   * Outstanding challenges kept, across every address. Past this the globally
+   * oldest is evicted to make room for a new one (#23) — refusing the newcomer
+   * instead, as this used to, turns a queue into a lockout: an unauthenticated
+   * caller can hold this map full indefinitely for about 4,096 requests a
+   * minute, and every arrival behind them is refused for as long as they keep
+   * it up.
+   */
   maxChallenges?: number
+  /**
+   * Outstanding challenges kept for one address. Past this *that address's*
+   * oldest is evicted for its own new one, before the global bound above is
+   * even considered.
+   *
+   * Eviction alone stops a flood from *locking out* the map, but it does not
+   * stop one from *owning* it: nothing otherwise prices a caller for asking
+   * under a fresh address every time, which costs nothing and is not proof of
+   * anything. This is the other half — a fixed, small, guaranteed share per
+   * address — so the two together are what #23 asks for.
+   */
+  maxChallengesPerAddress?: number
   now?: () => number
 }
 
@@ -185,6 +204,7 @@ export function createSessions(options: SessionOptions): SessionRegistry {
   const sessionTtl = options.sessionTtlMs ?? SESSION_TTL_MS
   const maxSessions = options.maxSessions ?? 4_096
   const maxChallenges = options.maxChallenges ?? 4_096
+  const maxChallengesPerAddress = options.maxChallengesPerAddress ?? 8
   const refill = options.refillPerSecond ?? DEFAULT_OBSERVATION_RATE
   const capacity = options.capacity ?? refill * OBSERVATION_BURST_SECONDS
 
@@ -322,8 +342,33 @@ export function createSessions(options: SessionOptions): SessionRegistry {
       if (typeof address !== 'string' || address.length === 0 || address.length > 128) {
         throw new SessionError('Ask for a challenge with the address you are proving.')
       }
+
+      // This address's own share first (#23): past its cap, its own oldest
+      // outstanding challenge is evicted for its new one. A fresh address every
+      // time skips this — nothing can stop that, since no proof is required —
+      // but it bounds what asking under the *same* one repeatedly can buy.
+      let mineOldest: string | undefined
+      let mineCount = 0
+      let mineOldestAt = Infinity
+      for (const [nonce, entry] of pending) {
+        if (entry.address !== address) continue
+        mineCount += 1
+        if (entry.issuedAt < mineOldestAt) {
+          mineOldestAt = entry.issuedAt
+          mineOldest = nonce
+        }
+      }
+      if (mineCount >= maxChallengesPerAddress && mineOldest !== undefined) pending.delete(mineOldest)
+
+      // The global bound. Evicted rather than refused: refusing the newcomer
+      // when this map is full is what let holding it full for about a minute
+      // (`sweep()`'s TTL) lock out every arrival behind the flood, indefinitely,
+      // for as long as the flood kept up (#23). Evicting the globally oldest
+      // entry instead costs a flood the map's own contents to hold shut, and
+      // costs it nothing to a caller who was not already at the front of it.
       if (pending.size >= maxChallenges) {
-        throw new SessionError('Too many challenges are outstanding here. Try again in a moment.')
+        const oldest = pending.keys().next()
+        if (!oldest.done) pending.delete(oldest.value)
       }
 
       const nonce = randomChallengeNonce()
